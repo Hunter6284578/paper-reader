@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.local
+.env.*.local
+server/.env
+.env.deploy
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data files
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+
+# Capacitor
+client/android/app/build/
+client/android/.gradle/
+
+# Python
+__pycache__/
+*.pyc
+
+# Test PDFs
+*.pdf
+
+# Debug screenshots
+emulator-*.png
+screenshot.png
+
+# Local scripts
+add_adb_to_path.ps1
+
+# Archives
+*.tar.gz
+
+# Workbuddy helper scripts (contain deployment logic, not secrets)
+.workbuddy/

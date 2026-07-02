@@ -37,6 +37,9 @@ const migrateCoreFeatures = sqlite.transaction(() => {
   if (hasTable('papers') && !hasColumn('papers', 'content_version')) {
     sqlite.exec(`ALTER TABLE papers ADD COLUMN content_version INTEGER NOT NULL DEFAULT 1`);
   }
+  if (hasTable('papers') && !hasColumn('papers', 'doi')) {
+    sqlite.exec(`ALTER TABLE papers ADD COLUMN doi TEXT`);
+  }
 
   if (hasTable('paragraphs') && !hasColumn('paragraphs', 'processed_content')) {
     sqlite.exec(`ALTER TABLE paragraphs ADD COLUMN processed_content TEXT`);
@@ -47,6 +50,9 @@ const migrateCoreFeatures = sqlite.transaction(() => {
   }
   if (hasTable('chunks') && !hasColumn('chunks', 'block_id')) {
     sqlite.exec(`ALTER TABLE chunks ADD COLUMN block_id INTEGER`);
+  }
+  if (hasTable('chunks') && !hasColumn('chunks', 'embedding')) {
+    sqlite.exec(`ALTER TABLE chunks ADD COLUMN embedding TEXT`);
   }
 
   if (hasTable('papers')) {
@@ -126,6 +132,17 @@ const migrateCoreFeatures = sqlite.transaction(() => {
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+
+      CREATE TABLE IF NOT EXISTS reading_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        duration_seconds INTEGER NOT NULL DEFAULT 0,
+        blocks_read INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_reading_sessions_paper ON reading_sessions(paper_id);
     `);
   }
 

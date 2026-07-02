@@ -24,6 +24,7 @@ export const papers = sqliteTable('papers', {
   pageCount: integer('page_count'),
   abstract: text('abstract'),
   authors: text('authors'),           // JSON array
+  doi: text('doi'),                   // CrossRef DOI
   tags: text('tags'),                 // JSON array
   status: text('status').notNull().default('unread'),
   processingStatus: text('processing_status').notNull().default('pending'),
@@ -48,7 +49,7 @@ export const chunks = sqliteTable('chunks', {
   pageNumber: integer('page_number'),
   blockId: integer('block_id'),
   tokenCount: integer('token_count'),
-  // embedding column removed — RAG now uses pure FTS5 search
+  embedding: text('embedding'), // JSON-serialized float32 array (1024-dim from bge-m3)
   createdAt: text('created_at').notNull().default(sql`(datetime('now'))`),
 }, (table) => [
   index('idx_chunks_paper').on(table.paperId),
@@ -319,3 +320,18 @@ export const userSettings = sqliteTable('user_settings', {
   value: text('value').notNull(),           // JSON 值
   updatedAt: text('updated_at').notNull().default(sql`(datetime('now'))`),
 });
+
+// ============================================================
+// 阅读会话表（跟踪阅读时间）
+// ============================================================
+export const readingSessions = sqliteTable('reading_sessions', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  paperId: text('paper_id').notNull().references(() => papers.id, { onDelete: 'cascade' }),
+  startedAt: text('started_at').notNull(),
+  endedAt: text('ended_at'),
+  durationSeconds: integer('duration_seconds').notNull().default(0),
+  blocksRead: integer('blocks_read').notNull().default(0),
+  createdAt: text('created_at').notNull().default(sql`(datetime('now'))`),
+}, (table) => [
+  index('idx_reading_sessions_paper').on(table.paperId),
+]);

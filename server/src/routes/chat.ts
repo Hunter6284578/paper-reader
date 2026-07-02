@@ -4,9 +4,9 @@ import { zValidator } from '@hono/zod-validator';
 import { eq, desc } from 'drizzle-orm';
 import { streamSSE } from 'hono/streaming';
 import { db } from '../db/connection.js';
-import { chatMessages } from '../db/schema.js';
+import { chatMessages, papers } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { ftsSearch } from '../services/vectorSearch.js';
+import { hybridSearch } from '../services/vectorSearch.js';
 import { streamChat, buildRAGSystemPrompt } from '../services/llmService.js';
 import { ENV } from '../config.js';
 import { getDeepSeekConfig } from '../services/modelSettings.js';
@@ -44,8 +44,8 @@ chatRoute.post('/ask', authMiddleware, zValidator('json', askSchema), async (c) 
     return c.json({ error: 'DeepSeek API 未配置' }, 503);
   }
 
-  // 1. FTS5 检索相关片段
-  const searchResults = await ftsSearch(question, paperId, 6);
+  // 1. 混合检索（FTS5 + 向量语义）
+  const searchResults = await hybridSearch(question, paperId, 6);
 
   if (searchResults.length === 0) {
     return c.json({ error: '未找到相关内容，请确保论文已完成处理' }, 404);
@@ -142,6 +142,105 @@ chatRoute.delete('/history/:paperId', authMiddleware, async (c) => {
   const paperId = c.req.param('paperId');
   db.delete(chatMessages).where(eq(chatMessages.paperId, paperId)).run();
   return c.json({ success: true });
+});
+
+// 全局跨论文问答（Global search across all papers）
+const globalAskSchema = z.object({
+  question: z.string().min(1),
+});
+
+chatRoute.post('/ask-global', authMiddleware, zValidator('json', globalAskSchema), async (c) => {
+  const { question } = c.req.valid('json');
+
+  if (!getDeepSeekConfig().apiKey) {
+    return c.json({ error: 'DeepSeek API 未配置' }, 503);
+  }
+
+  // Get all papers with ready processing status
+  const allPapers = db.select({ id: papers.id, title: papers.title })
+    .from(papers)
+    .where(eq(papers.processingStatus, 'ready'))
+    .all();
+
+  if (allPapers.length === 0) {
+    return c.json({ error: '没有已处理的论文' }, 404);
+  }
+
+  // Search top results from each paper
+  const allResults: Array<{
+    chunkId: number;
+    content: string;
+    sectionTitle: string | null;
+    pageNumber: number | null;
+    blockId: number | null;
+    bbox: number[] | null;
+    score: number;
+    paperId: string;
+    paperTitle: string;
+  }> = [];
+
+  for (const paper of allPapers) {
+    const results = await hybridSearch(question, paper.id, 3);
+    results.forEach(r => allResults.push({ ...r, paperId: paper.id, paperTitle: paper.title }));
+  }
+
+  // Sort by score and take top 8
+  allResults.sort((a, b) => b.score - a.score);
+  const topResults = allResults.slice(0, 8);
+
+  if (topResults.length === 0) {
+    return c.json({ error: '未找到相关内容' }, 404);
+  }
+
+  // Build context with paper titles
+  const contexts = topResults.map((r, i) => ({
+    content: r.content,
+    sectionTitle: r.sectionTitle,
+    pageNumber: r.pageNumber,
+    blockId: r.blockId,
+    index: i,
+    paperTitle: r.paperTitle,
+  }));
+
+  const systemPrompt = buildRAGSystemPrompt(contexts);
+
+  // SSE streaming response
+  return streamSSE(c, async (stream) => {
+    let fullContent = '';
+    try {
+      await streamChat(
+        [{ role: 'system', content: systemPrompt }, { role: 'user', content: question }],
+        async (chunk) => {
+          if (chunk.done) {
+            await stream.writeSSE({
+              event: 'done',
+              data: JSON.stringify({
+                references: topResults.map((r, i) => ({
+                  index: i + 1,
+                  chunkId: r.chunkId,
+                  blockId: r.blockId,
+                  sectionTitle: r.sectionTitle,
+                  pageNumber: r.pageNumber,
+                  bbox: r.bbox,
+                  score: r.score,
+                  paperId: r.paperId,
+                  paperTitle: r.paperTitle,
+                })),
+              }),
+            });
+          } else {
+            fullContent += chunk.content;
+            await stream.writeSSE({ event: 'chunk', data: chunk.content });
+          }
+        }
+      );
+    } catch (error: any) {
+      await stream.writeSSE({
+        event: 'error',
+        data: JSON.stringify({ error: error.message || 'AI 服务暂时不可用' }),
+      });
+    }
+  });
 });
 
 export { chatRoute };

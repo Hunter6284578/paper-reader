@@ -30,6 +30,9 @@ export const ENV = {
 
   DICT_API_URL: process.env.DICT_API_URL || 'https://api.dictionaryapi.dev/api/v2/entries/en',
 
+  SILICONFLOW_API_KEY: process.env.SILICONFLOW_API_KEY || '',
+  EMBEDDING_MODEL: process.env.EMBEDDING_MODEL || 'BAAI/bge-m3',
+
   PYTHON_EXECUTABLE: process.env.PYTHON_EXECUTABLE || 'python3',
   PYTHON_PARSER_PATH: process.env.PYTHON_PARSER_PATH || './python/docling_parser.py',
 } as const;

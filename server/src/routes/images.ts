@@ -10,11 +10,12 @@ import { eq, and, asc } from 'drizzle-orm';
 import { db } from '../db/connection.js';
 import { documentBlocks, pageImages } from '../db/schema.js';
 import { ENV } from '../config.js';
+import { authMiddleware } from '../middleware/auth.js';
 
 const imagesRoute = new Hono();
 
 // 原页视觉块裁切图
-imagesRoute.get('/block/:blockId', async (c) => {
+imagesRoute.get('/block/:blockId', authMiddleware, async (c) => {
   const blockId = parseInt(c.req.param('blockId'), 10);
   const block = db.select().from(documentBlocks).where(eq(documentBlocks.id, blockId)).get();
   if (!block?.assetPath) return c.json({ error: '视觉块不存在' }, 404);
@@ -29,7 +30,7 @@ imagesRoute.get('/block/:blockId', async (c) => {
 });
 
 // 获取论文所有页面图片列表
-imagesRoute.get('/:paperId', async (c) => {
+imagesRoute.get('/:paperId', authMiddleware, async (c) => {
   const paperId = c.req.param('paperId');
 
   const images = db
@@ -51,7 +52,7 @@ imagesRoute.get('/:paperId', async (c) => {
 });
 
 // 获取指定页面图片
-imagesRoute.get('/:paperId/:page', async (c) => {
+imagesRoute.get('/:paperId/:page', authMiddleware, async (c) => {
   const paperId = c.req.param('paperId');
   const page = parseInt(c.req.param('page'), 10);
 

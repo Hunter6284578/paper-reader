@@ -50,17 +50,30 @@ async function request<T>(
     headers['Content-Type'] = 'application/json';
   }
 
-  const response = await fetch(`${getApiBase()}${path}`, {
-    ...options,
-    headers,
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: '请求失败' }));
-    throw new Error(error.error || `HTTP ${response.status}`);
+  try {
+    const response = await fetch(`${getApiBase()}${path}`, {
+      ...options,
+      headers,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: '请求失败' }));
+      throw new Error(error.error || `HTTP ${response.status}`);
+    }
+
+    return response.json();
+  } catch (e: any) {
+    if (e.name === 'AbortError') {
+      throw new Error('请求超时，请检查网络连接');
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  return response.json();
 }
 
 export const api = {
@@ -144,4 +157,111 @@ export async function getAiSettings() {
 
 export async function saveAiSettings(apiKey: string | undefined, model: string) {
   return request<AiSettings>('/settings/ai', { method: 'PUT', body: JSON.stringify({ apiKey, model }) });
+}
+
+export async function saveReadingPosition(paperId: string, blockIndex: number) {
+  return api.post(`/reading/${paperId}/position`, { blockIndex });
+}
+
+export async function getReadingPosition(paperId: string) {
+  return api.get<{ position: { blockIndex: number; savedAt: string } | null }>(`/reading/${paperId}/position`);
+}
+
+// ============================================================
+// 全局跨论文问答 (Global Search)
+// ============================================================
+
+export interface GlobalSearchCallbacks {
+  onChunk: (text: string) => void;
+  onDone: (data: { references: Array<{ index: number; chunkId: number; blockId: number | null; sectionTitle: string | null; pageNumber: number | null; bbox: number[] | null; score: number; paperId: string; paperTitle: string }> }) => void;
+  onError: (error: string) => void;
+}
+
+export async function askGlobalQuestion(
+  question: string,
+  callbacks: GlobalSearchCallbacks,
+  signal?: AbortSignal,
+): Promise<void> {
+  const token = getToken();
+  const response = await fetch(`${getApiBase()}/chat/ask-global`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ question }),
+    signal,
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: '请求失败' }));
+    callbacks.onError(error.error || `HTTP ${response.status}`);
+    return;
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    callbacks.onError('无法读取响应流');
+    return;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let currentEvent = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      if (trimmed === '') {
+        currentEvent = '';
+        continue;
+      }
+
+      if (trimmed.startsWith('event:')) {
+        currentEvent = trimmed.slice(6).trim();
+        continue;
+      }
+
+      if (trimmed.startsWith('data:')) {
+        const data = trimmed.slice(5).trim();
+
+        if (currentEvent === 'chunk') {
+          callbacks.onChunk(data);
+        } else if (currentEvent === 'done') {
+          try {
+            callbacks.onDone(JSON.parse(data));
+          } catch {
+            // ignore parse errors on done event
+          }
+        } else if (currentEvent === 'error') {
+          try {
+            const parsed = JSON.parse(data);
+            callbacks.onError(parsed.error || '未知错误');
+          } catch {
+            callbacks.onError(data);
+          }
+        }
+      }
+    }
+  }
+}
+
+// ============================================================
+// 阅读统计 API
+// ============================================================
+
+export async function saveReadingSession(paperId: string, durationSeconds: number, blocksRead: number) {
+  return api.post(`/reading/${paperId}/session`, { durationSeconds, blocksRead });
+}
+
+export async function getReadingStats(paperId: string) {
+  return api.get<{ totalReadingTime: number; sessionCount: number; blocksRead: number; averageSessionTime: number }>(`/reading/${paperId}/stats`);
 }

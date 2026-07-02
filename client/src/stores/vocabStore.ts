@@ -23,6 +23,7 @@ interface VocabState {
   addVocab: (word: string, context?: string, paperId?: string, pageNumber?: number | null, blockId?: number | null) => Promise<VocabItem>;
   submitReview: (vocabId: number, grade: ReviewGrade) => Promise<void>;
   deleteVocab: (id: number) => Promise<void>;
+  markAsMastered: (id: number) => Promise<void>;
 }
 
 export const useVocabStore = create<VocabState>((set, get) => ({
@@ -194,5 +195,16 @@ export const useVocabStore = create<VocabState>((set, get) => ({
     set((state) => ({
       vocabItems: state.vocabItems.filter((v) => v.id !== id),
     }));
+  },
+
+  markAsMastered: async (id) => {
+    try {
+      const res = await api.post<{ vocabItem: VocabItem }>(`/vocab/master/${id}`, {});
+      set((state) => ({
+        vocabItems: state.vocabItems.map((v) => (v.id === id ? res.vocabItem : v)),
+      }));
+    } catch (e: any) {
+      console.error('标记掌握失败:', e);
+    }
   },
 }));

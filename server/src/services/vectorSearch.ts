@@ -3,6 +3,7 @@ import { db, sqlite } from '../db/connection.js';
 import { chunks, documentBlocks } from '../db/schema.js';
 import { chatCompletion } from './llmService.js';
 import { getDeepSeekConfig } from './modelSettings.js';
+import { generateQueryEmbedding, cosineSimilarity, isEmbeddingAvailable } from './embeddingService.js';
 
 interface SearchResult {
   chunkId: number;
@@ -12,6 +13,115 @@ interface SearchResult {
   blockId: number | null;
   bbox: number[] | null;
   score: number;
+}
+
+/**
+ * Hybrid search: combine FTS5 keyword search with vector semantic search
+ * using Reciprocal Rank Fusion (RRF).
+ * Falls back to pure FTS5 if embedding API is unavailable.
+ */
+export async function hybridSearch(
+  query: string,
+  paperId: string,
+  topN: number = 6
+): Promise<SearchResult[]> {
+  // Run FTS5 and vector search in parallel
+  const [ftsResults, vecResults] = await Promise.all([
+    ftsSearch(query, paperId, topN * 2),
+    vectorSearch(query, paperId, topN * 2).catch((err) => {
+      console.warn('[Vector] search failed, falling back to FTS5 only:', err.message);
+      return [] as SearchResult[];
+    }),
+  ]);
+
+  if (vecResults.length === 0) return ftsResults.slice(0, topN);
+
+  // RRF fusion: score = sum of 1/(k + rank), k=60
+  const k = 60;
+  const fused = new Map<number, { result: SearchResult; rrfScore: number }>();
+
+  ftsResults.forEach((r, rank) => {
+    const existing = fused.get(r.chunkId);
+    if (existing) {
+      existing.rrfScore += 1 / (k + rank + 1);
+    } else {
+      fused.set(r.chunkId, { result: r, rrfScore: 1 / (k + rank + 1) });
+    }
+  });
+
+  vecResults.forEach((r, rank) => {
+    const existing = fused.get(r.chunkId);
+    if (existing) {
+      existing.rrfScore += 1 / (k + rank + 1);
+    } else {
+      fused.set(r.chunkId, { result: r, rrfScore: 1 / (k + rank + 1) });
+    }
+  });
+
+  return [...fused.values()]
+    .sort((a, b) => b.rrfScore - a.rrfScore)
+    .slice(0, topN)
+    .map((m) => ({ ...m.result, score: m.rrfScore }));
+}
+
+/**
+ * Vector semantic search using embedding cosine similarity
+ */
+export async function vectorSearch(
+  query: string,
+  paperId: string,
+  topN: number = 6
+): Promise<SearchResult[]> {
+  if (!isEmbeddingAvailable()) {
+    console.log('[Vector] embedding API unavailable, skipping vector search');
+    return [];
+  }
+
+  // Generate query embedding
+  const queryEmbedding = await generateQueryEmbedding(query);
+
+  // Load all chunks with embeddings for this paper
+  const rows = sqlite.prepare(`
+    SELECT id, content, section_title, page_number, block_id, embedding
+    FROM chunks WHERE paper_id = ? AND embedding IS NOT NULL
+  `).all(paperId) as Array<{
+    id: number; content: string; section_title: string | null;
+    page_number: number | null; block_id: number | null; embedding: string;
+  }>;
+
+  if (rows.length === 0) {
+    console.log(`[Vector] no embeddings found for paper ${paperId}`);
+    return [];
+  }
+
+  // Compute cosine similarity for each chunk
+  const scored = rows.map((row) => {
+    const emb = JSON.parse(row.embedding) as number[];
+    return {
+      chunkId: row.id,
+      content: row.content,
+      sectionTitle: row.section_title,
+      pageNumber: row.page_number,
+      blockId: row.block_id,
+      bbox: getBlockBbox(row.block_id),
+      similarity: cosineSimilarity(queryEmbedding, emb),
+    };
+  });
+
+  // Sort by similarity descending
+  scored.sort((a, b) => b.similarity - a.similarity);
+
+  console.log(`[Vector] ${rows.length} chunks, top similarity: ${scored[0]?.similarity.toFixed(4)}`);
+
+  return scored.slice(0, topN).map((s) => ({
+    chunkId: s.chunkId,
+    content: s.content,
+    sectionTitle: s.sectionTitle,
+    pageNumber: s.pageNumber,
+    blockId: s.blockId,
+    bbox: s.bbox,
+    score: s.similarity,
+  }));
 }
 
 /**

@@ -25,6 +25,7 @@ export interface Paper {
   pageCount: number | null;
   abstract: string | null;
   authors: string[];
+  doi?: string | null;
   tags: string[];
   status: 'unread' | 'reading' | 'finished';
   processingStatus: 'pending' | 'processing' | 'ready' | 'error' | 'unsupported_scan';

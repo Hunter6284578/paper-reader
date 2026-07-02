@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { eq, and, gte, lt, asc, inArray } from 'drizzle-orm';
 import { db } from '../db/connection.js';
-import { documentBlocks, paragraphs, sentences, translations, papers } from '../db/schema.js';
+import { documentBlocks, paragraphs, sentences, translations, papers, userSettings, readingSessions } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { translateParagraphs, translateSentences } from '../services/translationService.js';
 
@@ -342,6 +342,60 @@ readingRoute.post('/:paperId/translate', authMiddleware, zValidator('json', tran
     console.error('[翻译API] 失败:', e);
     return c.json({ error: e.message || '翻译失败' }, 500);
   }
+});
+
+// 保存阅读位置
+readingRoute.post('/:paperId/position', authMiddleware, async (c) => {
+  const paperId = c.req.param('paperId');
+  const { blockIndex } = await c.req.json();
+  db.insert(userSettings).values({
+    key: `reading_pos_${paperId}`,
+    value: JSON.stringify({ blockIndex, savedAt: new Date().toISOString() }),
+    updatedAt: new Date().toISOString(),
+  }).onConflictDoUpdate({
+    target: userSettings.key,
+    set: {
+      value: JSON.stringify({ blockIndex, savedAt: new Date().toISOString() }),
+      updatedAt: new Date().toISOString(),
+    },
+  }).run();
+  return c.json({ success: true });
+});
+
+// 获取阅读位置
+readingRoute.get('/:paperId/position', authMiddleware, async (c) => {
+  const paperId = c.req.param('paperId');
+  const setting = db.select().from(userSettings).where(eq(userSettings.key, `reading_pos_${paperId}`)).get();
+  if (!setting) return c.json({ position: null });
+  return c.json({ position: JSON.parse(setting.value) });
+});
+
+// 记录阅读会话
+readingRoute.post('/:paperId/session', authMiddleware, async (c) => {
+  const paperId = c.req.param('paperId');
+  const { durationSeconds, blocksRead } = await c.req.json() as { durationSeconds: number; blocksRead: number };
+  db.insert(readingSessions).values({
+    paperId,
+    startedAt: new Date(Date.now() - durationSeconds * 1000).toISOString(),
+    endedAt: new Date().toISOString(),
+    durationSeconds: Math.round(durationSeconds),
+    blocksRead: blocksRead || 0,
+  }).run();
+  return c.json({ success: true });
+});
+
+// 获取论文阅读统计
+readingRoute.get('/:paperId/stats', authMiddleware, async (c) => {
+  const paperId = c.req.param('paperId');
+  const sessions = db.select().from(readingSessions).where(eq(readingSessions.paperId, paperId)).all();
+  const totalSeconds = sessions.reduce((sum, s) => sum + s.durationSeconds, 0);
+  const totalBlocks = sessions.reduce((sum, s) => sum + s.blocksRead, 0);
+  return c.json({
+    totalReadingTime: totalSeconds,
+    sessionCount: sessions.length,
+    blocksRead: totalBlocks,
+    averageSessionTime: sessions.length > 0 ? Math.round(totalSeconds / sessions.length) : 0,
+  });
 });
 
 export { readingRoute };

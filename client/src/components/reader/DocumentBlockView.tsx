@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { DocumentBlock, Highlight } from '../../types';
 import { useReaderStore } from '../../stores/readerStore';
+import { usePaperStore } from '../../stores/paperStore';
 import { useTranslationStore } from '../../stores/translationStore';
 import { resolveApiUrl } from '../../services/api';
 import MathText from './MathText';
@@ -15,6 +16,8 @@ interface Props {
 export default function DocumentBlockView({ block, highlights, onVisible, onOpenOriginal }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const settings = useReaderStore((state) => state.settings);
+  const deleteHighlight = usePaperStore((state) => state.deleteHighlight);
+  const [activeHighlightId, setActiveHighlightId] = useState<string | null>(null);
   const translated = useTranslationStore((state) => state.getParagraphTranslation('', block.id));
   const paperTranslation = useTranslationStore((state) => {
     for (const values of Object.values(state.cache)) if (values[block.id]) return values[block.id];
@@ -86,7 +89,17 @@ export default function DocumentBlockView({ block, highlights, onVisible, onOpen
     let cursor = 0;
     ranges.forEach((range, index) => {
       if (range.start > cursor) nodes.push(<MathText key={`t${index}`} text={text.slice(cursor, range.start)} />);
-      nodes.push(<mark key={`m${index}`} style={{ backgroundColor: `${range.color}60` }}>{text.slice(range.start, range.end)}</mark>);
+      nodes.push(
+        <span key={`m${index}`} className="relative cursor-pointer" onClick={(e) => { e.stopPropagation(); setActiveHighlightId(blockHighlights[index]?.id || null); }}>
+          <mark style={{ backgroundColor: `${range.color}60` }}>{text.slice(range.start, range.end)}</mark>
+          {activeHighlightId === blockHighlights[index]?.id && (
+            <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 z-50 bg-white rounded-lg shadow-lg border p-1 flex gap-1 whitespace-nowrap">
+              <button className="text-xs px-2 py-1 text-red-600 hover:bg-red-50 rounded" onClick={(e) => { e.stopPropagation(); deleteHighlight(activeHighlightId!); setActiveHighlightId(null); }}>删除</button>
+              <button className="text-xs px-2 py-1 text-gray-500 hover:bg-gray-50 rounded" onClick={(e) => { e.stopPropagation(); setActiveHighlightId(null); }}>关闭</button>
+            </span>
+          )}
+        </span>
+      );
       cursor = Math.max(cursor, range.end);
     });
     if (cursor < text.length) nodes.push(<MathText key="tlast" text={text.slice(cursor)} />);

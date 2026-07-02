@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { DocumentBlock, Highlight, StructureSection } from '../../types';
-import { fetchBlocks, fetchStructure } from '../../services/api';
+import { fetchBlocks, fetchStructure, saveReadingPosition, getReadingPosition, saveReadingSession } from '../../services/api';
 import { getCachedJson, putCachedJson, getOfflineBlocks, syncOfflineData, onOnlineChange, isOnline } from '../../services/offlineDb';
 import { useReaderStore } from '../../stores/readerStore';
 import { useTranslationStore } from '../../stores/translationStore';
@@ -30,6 +30,10 @@ export default function ReadingArea({ paperId, highlights, containerRef, onSecti
   const [pageTarget, setPageTarget] = useState<{ pageNumber: number; bbox: number[] | null } | null>(null);
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
+  const lastSavedIndexRef = useRef(-1);
+  const restoredRef = useRef(false);
+  const currentIndexRef = useRef(0);
+  const blocksReadCountRef = useRef(0);
 
   const cache = useCallback((next: DocumentBlock[], nextTotal: number) => {
     void putCachedJson(`blocks:${paperId}`, { blocks: next, total: nextTotal });
@@ -148,6 +152,8 @@ export default function ReadingArea({ paperId, highlights, containerRef, onSecti
 
   const handleVisible = useCallback((index: number, id: number) => {
     setCurrentParagraph(index);
+    currentIndexRef.current = index;
+    blocksReadCountRef.current += 1;
     if (total - index <= 8) void loadMore();
     if (settings.showTranslation) {
       const candidates = blocks.filter((block) => block.type === 'text' && block.blockIndex >= index && block.blockIndex <= index + TRANSLATE_AHEAD).map((block) => block.id);
@@ -227,6 +233,62 @@ export default function ReadingArea({ paperId, highlights, containerRef, onSecti
     window.addEventListener('reader:navigate', navigate);
     return () => window.removeEventListener('reader:navigate', navigate);
   }, [blocks, containerRef, jumpToIndex, openOriginal]);
+
+  // Fetch saved reading position on mount and restore after blocks load
+  useEffect(() => {
+    let cancelled = false;
+    restoredRef.current = false;
+    (async () => {
+      try {
+        const { position } = await getReadingPosition(paperId);
+        if (cancelled || !position) return;
+        lastSavedIndexRef.current = position.blockIndex;
+        // Wait for blocks to be available, then scroll
+        const restoreScroll = () => {
+          if (restoredRef.current) return;
+          const target = document.querySelector(`[data-block-index="${position.blockIndex}"]`);
+          if (target) {
+            restoredRef.current = true;
+            target.scrollIntoView({ behavior: 'auto', block: 'start' });
+          }
+        };
+        // Try immediately, then retry as blocks load
+        restoreScroll();
+        const timer = setInterval(() => {
+          restoreScroll();
+          if (restoredRef.current) clearInterval(timer);
+        }, 300);
+        setTimeout(() => clearInterval(timer), 5000);
+      } catch {
+        // Ignore errors - position restore is best-effort
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [paperId]);
+
+  // Auto-save reading position every 10 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const idx = currentIndexRef.current;
+      if (idx > 0 && idx !== lastSavedIndexRef.current) {
+        lastSavedIndexRef.current = idx;
+        void saveReadingPosition(paperId, idx);
+      }
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [paperId]);
+
+  // Track reading session time and save on unmount / paperId change
+  useEffect(() => {
+    const startTime = Date.now();
+    blocksReadCountRef.current = 0;
+    return () => {
+      const duration = (Date.now() - startTime) / 1000;
+      if (duration > 5) {
+        saveReadingSession(paperId, duration, blocksReadCountRef.current).catch(() => {});
+      }
+    };
+  }, [paperId]);
 
   if (loading) return <div className="flex-1 flex items-center justify-center text-gray-500">正在准备重排阅读内容…</div>;
   if (!blocks.length) return <div className="flex-1 flex items-center justify-center px-8 text-center text-gray-500">暂无可阅读内容。论文可能仍在处理，或属于暂不支持的扫描版 PDF。</div>;

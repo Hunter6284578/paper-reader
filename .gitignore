@@ -49,6 +49,7 @@ add_adb_to_path.ps1
 
 # Archives
 *.tar.gz
+*.apk
 
 # Workbuddy helper scripts (contain deployment logic, not secrets)
 .workbuddy/

@@ -90,11 +90,13 @@ export function buildRAGSystemPrompt(
     pageNumber: number | null;
     blockId: number | null;
     index: number;
+    paperTitle?: string;
   }>
 ): string {
   const contextText = contexts
     .map((c) => {
       const parts: string[] = [];
+      if (c.paperTitle) parts.push(`Paper: "${c.paperTitle}"`);
       parts.push(`Section: "${c.sectionTitle || '未分类'}"`);
       if (c.pageNumber) parts.push(`Page: ${c.pageNumber}`);
       if (c.blockId) parts.push(`Block: ${c.blockId}`);

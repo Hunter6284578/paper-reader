@@ -4,7 +4,7 @@ import { zValidator } from '@hono/zod-validator';
 import { eq, and } from 'drizzle-orm';
 import { v4 as uuidv4 } from 'uuid';
 import { db } from '../db/connection.js';
-import { highlights } from '../db/schema.js';
+import { highlights, papers } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 
 const highlightsRoute = new Hono();
@@ -88,6 +88,31 @@ highlightsRoute.delete('/:id', authMiddleware, async (c) => {
   const id = c.req.param('id');
   db.delete(highlights).where(eq(highlights.id, id)).run();
   return c.json({ success: true });
+});
+
+// 导出高亮笔记为 Markdown
+highlightsRoute.get('/export/:paperId', authMiddleware, async (c) => {
+  const paperId = c.req.param('paperId');
+  const paper = db.select().from(papers).where(eq(papers.id, paperId)).get();
+  const list = db.select().from(highlights).where(eq(highlights.paperId, paperId)).all();
+
+  // Generate markdown
+  let md = `# ${paper?.title || 'Unknown'} - 高亮笔记\n\n`;
+  md += `导出时间: ${new Date().toISOString()}\n\n---\n\n`;
+
+  list.forEach((h) => {
+    const color = h.color || '#FFEB3B';
+    const text = h.selectedText || '';
+    md += `> <mark style="background:${color}">${text}</mark>\n\n`;
+    if (h.comment) md += `**笔记:** ${h.comment}\n\n`;
+    if (h.pageNumber) md += `📄 第 ${h.pageNumber} 页\n\n`;
+    md += `---\n\n`;
+  });
+
+  return c.text(md, 200, {
+    'Content-Type': 'text/markdown; charset=utf-8',
+    'Content-Disposition': `attachment; filename="${encodeURIComponent(paper?.title || 'notes')}.md"`,
+  });
 });
 
 export { highlightsRoute };

@@ -10,6 +10,8 @@ import {
 import { ENV } from '../config.js';
 import { detectFormulas } from './formulaDetector.js';
 import { parseWithPdfjs } from './pdfjsParser.js';
+import { generateEmbeddings, isEmbeddingAvailable } from './embeddingService.js';
+import { extractMetadata } from './metadataService.js';
 
 let workerRunning = false;
 let workerTimer: NodeJS.Timeout | null = null;
@@ -320,6 +322,44 @@ function ingestPdfjsResult(paperId: string, doc: { pageCount: number; blocks: Ar
   })();
 }
 
+// ---------- Embedding Generation ----------
+
+/**
+ * Generate embeddings for all chunks of a paper.
+ * Runs asynchronously after ingestion, does not block paper processing.
+ */
+async function generateChunkEmbeddings(paperId: string): Promise<void> {
+  if (!isEmbeddingAvailable()) {
+    console.log(`[Embedding] API unavailable, skipping embedding generation for ${paperId}`);
+    return;
+  }
+
+  const rows = sqlite.prepare(
+    'SELECT id, content FROM chunks WHERE paper_id = ? AND embedding IS NULL'
+  ).all(paperId) as Array<{ id: number; content: string }>;
+
+  if (rows.length === 0) return;
+
+  console.log(`[Embedding] generating embeddings for ${rows.length} chunks of paper ${paperId}`);
+
+  const texts = rows.map((r) => r.content);
+  try {
+    const embeddings = await generateEmbeddings(texts);
+
+    const updateStmt = sqlite.prepare('UPDATE chunks SET embedding = ? WHERE id = ?');
+    const updateAll = sqlite.transaction(() => {
+      embeddings.forEach((emb, i) => {
+        updateStmt.run(JSON.stringify(emb), rows[i].id);
+      });
+    });
+    updateAll();
+
+    console.log(`[Embedding] done: ${embeddings.length} embeddings stored for paper ${paperId}`);
+  } catch (err) {
+    console.error(`[Embedding] failed for paper ${paperId}:`, err);
+  }
+}
+
 // ---------- Main Processing Function ----------
 
 /** Process a paper using the Docling Python parser. */
@@ -374,7 +414,26 @@ export async function processPaperAsync(paperId: string): Promise<void> {
       updatedAt: new Date().toISOString(),
     }).where(eq(papers.id, paperId)).run();
 
+    // Try to extract metadata from CrossRef
+    try {
+      const metadata = await extractMetadata(firstText, paper.title);
+      const hasNewData = (metadata.title && metadata.title !== paper.title) || metadata.authors || metadata.doi;
+      if (hasNewData) {
+        db.update(papers).set({
+          title: metadata.title || paper.title,
+          authors: metadata.authors ? JSON.stringify(metadata.authors) : null,
+          doi: metadata.doi || null,
+          abstract: metadata.abstract || firstText.slice(0, 500),
+        }).where(eq(papers.id, paperId)).run();
+      }
+    } catch (e) {
+      console.warn('[Metadata] CrossRef lookup failed:', e);
+    }
+
     console.log(`[pdfProcessor] Paper ${paperId} processed: ${result.blocks.length} blocks, ${result.pageCount} pages`);
+
+    // Generate embeddings asynchronously (non-blocking)
+    await generateChunkEmbeddings(paperId);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
 
@@ -399,7 +458,26 @@ export async function processPaperAsync(paperId: string): Promise<void> {
           updatedAt: new Date().toISOString(),
         }).where(eq(papers.id, paperId)).run();
 
+        // Try to extract metadata from CrossRef (pdfjs fallback path)
+        try {
+          const metadata = await extractMetadata(firstText, paper.title);
+          const hasNewData = (metadata.title && metadata.title !== paper.title) || metadata.authors || metadata.doi;
+          if (hasNewData) {
+            db.update(papers).set({
+              title: metadata.title || paper.title,
+              authors: metadata.authors ? JSON.stringify(metadata.authors) : null,
+              doi: metadata.doi || null,
+              abstract: metadata.abstract || firstText.slice(0, 500),
+            }).where(eq(papers.id, paperId)).run();
+          }
+        } catch (e) {
+          console.warn('[Metadata] CrossRef lookup failed (pdfjs fallback):', e);
+        }
+
         console.log(`[pdfProcessor] Paper ${paperId} processed with pdfjs fallback: ${doc.blocks.length} blocks`);
+
+        // Generate embeddings asynchronously (non-blocking)
+        await generateChunkEmbeddings(paperId);
         return;
       } catch (fallbackError) {
         const fbMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);

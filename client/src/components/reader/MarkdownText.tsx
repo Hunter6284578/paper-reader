@@ -1,7 +1,11 @@
 import { useMemo } from 'react';
+import type { ChatReference } from '../../types';
+import ReferenceBadge from './ReferenceBadge';
 
 interface Props {
   text: string;
+  references?: ChatReference[];
+  onCitationClick?: (index: number) => void;
 }
 
 type Node =
@@ -18,14 +22,22 @@ type Inline =
   | { type: 'strong'; value: string }
   | { type: 'em'; value: string }
   | { type: 'code'; value: string }
+  | { type: 'cite'; index: number }
   | { type: 'br' };
 
-export default function MarkdownText({ text }: Props) {
-  const nodes = useMemo(() => parseMarkdown(text), [text]);
-  return <div className="chat-markdown">{nodes.map((n, i) => renderBlock(n, i))}</div>;
+const INLINE_RE = /(\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+)`|\[(\d+)(?:,\s*[^\]]*?)?\]|\n)/g;
+
+export default function MarkdownText({ text, references, onCitationClick }: Props) {
+  const refMap = useMemo(
+    () => new Map((references ?? []).map((r) => [r.index, r])),
+    [references],
+  );
+  const hasCitations = refMap.size > 0;
+  const nodes = useMemo(() => parseMarkdown(text, hasCitations ? refMap : undefined), [text, hasCitations, refMap]);
+  return <div className="chat-markdown">{nodes.map((n, i) => renderBlock(n, i, refMap, onCitationClick))}</div>;
 }
 
-function parseMarkdown(src: string): Node[] {
+function parseMarkdown(src: string, refMap?: Map<number, ChatReference>): Node[] {
   if (!src) return [];
   const lines = src.split('\n');
   const nodes: Node[] = [];
@@ -57,12 +69,12 @@ function parseMarkdown(src: string): Node[] {
 
     // Headings
     if (line.startsWith('### ')) {
-      nodes.push({ type: 'h4', children: parseInline(line.slice(4)) });
+      nodes.push({ type: 'h4', children: parseInline(line.slice(4), refMap) });
       i++;
       continue;
     }
     if (line.startsWith('## ')) {
-      nodes.push({ type: 'h3', children: parseInline(line.slice(3)) });
+      nodes.push({ type: 'h3', children: parseInline(line.slice(3), refMap) });
       i++;
       continue;
     }
@@ -71,7 +83,7 @@ function parseMarkdown(src: string): Node[] {
     if (/^[\-\*]\s/.test(line)) {
       const items: Inline[][] = [];
       while (i < lines.length && /^[\-\*]\s/.test(lines[i])) {
-        items.push(parseInline(lines[i].replace(/^[\-\*]\s/, '')));
+        items.push(parseInline(lines[i].replace(/^[\-\*]\s/, ''), refMap));
         i++;
       }
       nodes.push({ type: 'ul', items });
@@ -82,7 +94,7 @@ function parseMarkdown(src: string): Node[] {
     if (/^\d+[.)]\s/.test(line)) {
       const items: Inline[][] = [];
       while (i < lines.length && /^\d+[.)]\s/.test(lines[i])) {
-        items.push(parseInline(lines[i].replace(/^\d+[.)]\s/, '')));
+        items.push(parseInline(lines[i].replace(/^\d+[.)]\s/, ''), refMap));
         i++;
       }
       nodes.push({ type: 'ol', items });
@@ -103,21 +115,20 @@ function parseMarkdown(src: string): Node[] {
     }
     if (paraLines.length > 0) {
       const combined = paraLines.join('\n');
-      nodes.push({ type: 'p', children: parseInline(combined) });
+      nodes.push({ type: 'p', children: parseInline(combined, refMap) });
     }
   }
 
   return nodes;
 }
 
-function parseInline(text: string): Inline[] {
+function parseInline(text: string, refMap?: Map<number, ChatReference>): Inline[] {
   const result: Inline[] = [];
-  // Regex: **bold**, *italic*, `code`, \n
-  const re = /(\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+)`|\n)/g;
+  INLINE_RE.lastIndex = 0;
   let last = 0;
   let m: RegExpExecArray | null;
 
-  while ((m = re.exec(text)) !== null) {
+  while ((m = INLINE_RE.exec(text)) !== null) {
     if (m.index > last) {
       result.push({ type: 'text', value: text.slice(last, m.index) });
     }
@@ -127,6 +138,13 @@ function parseInline(text: string): Inline[] {
       result.push({ type: 'em', value: m[3] });
     } else if (m[4]) {
       result.push({ type: 'code', value: m[4] });
+    } else if (m[5]) {
+      const idx = parseInt(m[5], 10);
+      if (refMap?.has(idx)) {
+        result.push({ type: 'cite', index: idx });
+      } else {
+        result.push({ type: 'text', value: m[0] });
+      }
     } else if (m[0] === '\n') {
       result.push({ type: 'br' });
     }
@@ -138,13 +156,18 @@ function parseInline(text: string): Inline[] {
   return result.length > 0 ? result : [{ type: 'text', value: text }];
 }
 
-function renderInline(nodes: Inline[], key?: number) {
+function renderInline(nodes: Inline[], refMap: Map<number, ChatReference>, onCitationClick?: (index: number) => void, key?: number) {
   return (
     <span key={key}>
       {nodes.map((n, i) => {
         if (n.type === 'strong') return <strong key={i}>{n.value}</strong>;
         if (n.type === 'em') return <em key={i}>{n.value}</em>;
         if (n.type === 'code') return <code key={i} className="bg-gray-100 text-gray-800 px-1 py-0.5 rounded text-xs font-mono">{n.value}</code>;
+        if (n.type === 'cite') {
+          const ref = refMap.get(n.index);
+          if (ref) return <ReferenceBadge key={i} reference={ref} onNavigate={() => onCitationClick?.(n.index)} />;
+          return <span key={i}>[{n.index}]</span>;
+        }
         if (n.type === 'br') return <br key={i} />;
         return <span key={i}>{n.value}</span>;
       })}
@@ -152,22 +175,23 @@ function renderInline(nodes: Inline[], key?: number) {
   );
 }
 
-function renderBlock(node: Node, key: number): React.ReactNode {
+function renderBlock(node: Node, key: number, refMap: Map<number, ChatReference>, onCitationClick?: (index: number) => void): React.ReactNode {
+  const ri = (nodes: Inline[]) => renderInline(nodes, refMap, onCitationClick);
   switch (node.type) {
     case 'h3':
-      return <h3 key={key} className="font-semibold text-sm mt-3 mb-1">{renderInline(node.children)}</h3>;
+      return <h3 key={key} className="font-semibold text-sm mt-3 mb-1">{ri(node.children)}</h3>;
     case 'h4':
-      return <h4 key={key} className="font-semibold text-sm mt-2 mb-1">{renderInline(node.children)}</h4>;
+      return <h4 key={key} className="font-semibold text-sm mt-2 mb-1">{ri(node.children)}</h4>;
     case 'ul':
       return (
         <ul key={key} className="list-disc pl-5 my-1 space-y-0.5">
-          {node.items.map((item, i) => <li key={i}>{renderInline(item)}</li>)}
+          {node.items.map((item, i) => <li key={i}>{ri(item)}</li>)}
         </ul>
       );
     case 'ol':
       return (
         <ol key={key} className="list-decimal pl-5 my-1 space-y-0.5">
-          {node.items.map((item, i) => <li key={i}>{renderInline(item)}</li>)}
+          {node.items.map((item, i) => <li key={i}>{ri(item)}</li>)}
         </ol>
       );
     case 'code':
@@ -179,6 +203,6 @@ function renderBlock(node: Node, key: number): React.ReactNode {
     case 'hr':
       return <hr key={key} className="border-gray-200 my-3" />;
     case 'p':
-      return <p key={key} className="my-1">{renderInline(node.children)}</p>;
+      return <p key={key} className="my-1">{ri(node.children)}</p>;
   }
 }

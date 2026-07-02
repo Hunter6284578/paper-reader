@@ -261,7 +261,7 @@ vocabRoute.post('/review/:id', authMiddleware, zValidator('json', reviewSchema),
   );
 
   // 更新生词状态
-  const updated = db.update(vocabItems)
+  let updated = db.update(vocabItems)
     .set({
       repetitions: result.repetitions,
       intervalDays: result.intervalDays,
@@ -274,6 +274,16 @@ vocabRoute.post('/review/:id', authMiddleware, zValidator('json', reviewSchema),
     .where(eq(vocabItems.id, id))
     .returning()
     .get();
+
+  // Auto-master: if easeFactor >= 2.5 and interval >= 21 days and total reviews >= 5
+  // Only trigger on "good" or "easy" grades (quality >= 4)
+  if (quality >= 4 && updated.easeFactor >= 2.5 && updated.intervalDays >= 21 && updated.totalReviews >= 5) {
+    updated = db.update(vocabItems)
+      .set({ status: 'mastered' })
+      .where(eq(vocabItems.id, id))
+      .returning()
+      .get();
+  }
 
   // 记录复习日志
   db.insert(reviewLogs).values({
@@ -316,6 +326,23 @@ vocabRoute.delete('/:id', authMiddleware, async (c) => {
   const id = parseInt(c.req.param('id'), 10);
   db.delete(vocabItems).where(eq(vocabItems.id, id)).run();
   return c.json({ success: true });
+});
+
+// 手动标记为已掌握
+vocabRoute.post('/master/:id', authMiddleware, async (c) => {
+  const id = parseInt(c.req.param('id'), 10);
+  const vocab = db.select().from(vocabItems).where(eq(vocabItems.id, id)).get();
+  if (!vocab) {
+    return c.json({ error: '生词不存在' }, 404);
+  }
+
+  const updated = db.update(vocabItems)
+    .set({ status: 'mastered' })
+    .where(eq(vocabItems.id, id))
+    .returning()
+    .get();
+
+  return c.json({ vocabItem: updated });
 });
 
 // 获取学习统计

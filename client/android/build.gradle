@@ -20,7 +20,12 @@ buildscript {
 
 apply from: "variables.gradle"
 
+def externalBuildRoot = System.getenv('PAPER_READER_ANDROID_BUILD_DIR')
+
 allprojects {
+    if (externalBuildRoot) {
+        buildDir = new File(externalBuildRoot, project.name)
+    }
     repositories {
         maven { url 'https://maven.aliyun.com/repository/google' }
         maven { url 'https://maven.aliyun.com/repository/central' }
@@ -30,5 +35,5 @@ allprojects {
 }
 
 task clean(type: Delete) {
-    delete rootProject.buildDir
+    delete allprojects.collect { it.buildDir }
 }

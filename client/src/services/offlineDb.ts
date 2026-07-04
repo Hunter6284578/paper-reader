@@ -1,5 +1,5 @@
 import { Capacitor } from '@capacitor/core';
-import { CapacitorSQLite, SQLiteConnection, type SQLiteDBConnection } from '@capacitor-community/sqlite';
+import { CapacitorSQLite, SQLiteConnection, type SQLiteDBConnection, type capSQLiteSet } from '@capacitor-community/sqlite';
 import { api, resolveApiUrl, authorizedFetch } from './api';
 import type { DocumentBlock } from '../types';
 
@@ -9,7 +9,7 @@ let initPromise: Promise<void> | null = null;
 // ============================================================
 // Schema version — bump when adding breaking changes
 // ============================================================
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 async function initNative(): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;
@@ -119,10 +119,23 @@ async function initNative(): Promise<void> {
       synced INTEGER DEFAULT 0,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS offline_outbox (
+      id TEXT PRIMARY KEY,
+      action_type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_offline_outbox_created ON offline_outbox(created_at);
   `);
+
+  await migrateLegacyOutbox();
 }
 
 export async function initOfflineDb(): Promise<void> {
+  if (!Capacitor.isNativePlatform()) migrateLegacyWebOutbox();
   if (!initPromise) initPromise = initNative();
   return initPromise;
 }
@@ -154,18 +167,9 @@ export async function getCachedJson<T>(key: string): Promise<T | null> {
   return json ? JSON.parse(json) as T : null;
 }
 
-export async function queueOfflineAction(type: string, payload: unknown, id = crypto.randomUUID()): Promise<string> {
+export async function queueOfflineAction(type: string, payload: unknown, id: string = crypto.randomUUID()): Promise<string> {
   await initOfflineDb();
-  if (connection) {
-    await connection.run(
-      'INSERT OR IGNORE INTO offline_actions(id,action_type,payload,created_at) VALUES(?,?,?,?)',
-      [id, type, JSON.stringify(payload), new Date().toISOString()],
-    );
-  } else {
-    const actions = JSON.parse(localStorage.getItem('offline:actions') || '[]') as unknown[];
-    actions.push({ id, type, payload, createdAt: new Date().toISOString() });
-    localStorage.setItem('offline:actions', JSON.stringify(actions));
-  }
+  await putOutboxItem(id, type, payload);
   return id;
 }
 
@@ -222,23 +226,10 @@ export async function downloadPaperForOffline(paperId: string, onProgress?: (ste
     onProgress?.('获取下载清单...');
     const manifest = await api.get<ManifestResponse>(`/reading/${paperId}/manifest`);
 
-    // 1. Save paper metadata
-    onProgress?.('保存论文信息...');
-    await savePaperOffline(paperId, manifest.title, manifest.contentVersion);
-
-    // 2. Save all document blocks
-    onProgress?.('保存文档块...');
-    await saveBlocksOffline(paperId, manifest.blocks);
-
-    // 3. Save all translations
-    onProgress?.('保存翻译...');
-    await saveTranslationsOffline(manifest.translations);
-
-    // 4. Download and cache PDF
+    // Download assets before publishing the new Paper Snapshot.
     onProgress?.('下载 PDF...');
     await downloadAssetOffline(paperId, manifest.pdfUrl, 'pdf');
 
-    // 5. Download block assets (figures, tables, etc.)
     onProgress?.('下载图表资源...');
     for (let i = 0; i < manifest.assets.length; i++) {
       const asset = manifest.assets[i];
@@ -246,13 +237,9 @@ export async function downloadPaperForOffline(paperId: string, onProgress?: (ste
       onProgress?.(`下载图表资源... (${i + 1}/${manifest.assets.length})`);
     }
 
-    // 6. Update last_synced timestamp
-    if (connection) {
-      await connection.run(
-        'UPDATE offline_papers SET last_synced = ? WHERE id = ?',
-        [new Date().toISOString(), paperId],
-      );
-    }
+    // Metadata, Reading Blocks, and translations become visible atomically.
+    onProgress?.('提交离线快照...');
+    await commitPaperSnapshot(paperId, manifest);
 
     // Also keep the legacy cache for backward compatibility
     await putCachedJson(`blocks:${paperId}`, {
@@ -280,67 +267,54 @@ export async function downloadPaperForOffline(paperId: string, onProgress?: (ste
   }
 }
 
-async function savePaperOffline(paperId: string, title: string, contentVersion: number): Promise<void> {
+async function commitPaperSnapshot(paperId: string, manifest: ManifestResponse): Promise<void> {
   if (connection) {
-    await connection.run(
-      `INSERT INTO offline_papers(id,title,status,content_version,last_synced) VALUES(?,?,?,?,?)
-       ON CONFLICT(id) DO UPDATE SET title=excluded.title, content_version=excluded.content_version, last_synced=excluded.last_synced`,
-      [paperId, title, 'downloaded', contentVersion, new Date().toISOString()],
-    );
-  } else {
-    const papers = JSON.parse(localStorage.getItem('offline:papers') || '{}');
-    papers[paperId] = { id: paperId, title, contentVersion, status: 'downloaded', lastSynced: new Date().toISOString() };
-    localStorage.setItem('offline:papers', JSON.stringify(papers));
-  }
-}
-
-async function saveBlocksOffline(paperId: string, blocks: ManifestBlock[]): Promise<void> {
-  if (connection) {
-    // Clear existing blocks for this paper, then insert new ones
-    await connection.run('DELETE FROM offline_blocks WHERE paper_id = ?', [paperId]);
-    for (const b of blocks) {
-      await connection.run(
-        `INSERT OR REPLACE INTO offline_blocks(id,paper_id,block_type,block_index,content,processed_content,section_title,page_number,bbox,asset_path,caption,char_count,translation)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [
-          b.id, paperId, b.type, b.blockIndex, b.content, b.processedContent,
-          b.sectionTitle, b.pageNumber, b.bbox ? JSON.stringify(b.bbox) : null,
-          b.assetPath, b.caption, b.charCount, b.translation,
+    const statements: capSQLiteSet[] = [
+      {
+        statement: "DELETE FROM offline_translations WHERE source_type = 'block' AND source_id IN (SELECT id FROM offline_blocks WHERE paper_id = ?)",
+        values: [paperId],
+      },
+      { statement: 'DELETE FROM offline_blocks WHERE paper_id = ?', values: [paperId] },
+      ...manifest.blocks.map((block) => ({
+        statement: `INSERT INTO offline_blocks(id,paper_id,block_type,block_index,content,processed_content,section_title,page_number,bbox,asset_path,caption,char_count,translation)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        values: [
+          block.id, paperId, block.type, block.blockIndex, block.content, block.processedContent,
+          block.sectionTitle, block.pageNumber, block.bbox ? JSON.stringify(block.bbox) : null,
+          block.assetPath, block.caption, block.charCount, block.translation,
         ],
-      );
-    }
-  } else {
-    localStorage.setItem(`offline:blocks_struct:${paperId}`, JSON.stringify(blocks));
+      })),
+      ...manifest.translations.map((translation) => ({
+        statement: 'INSERT OR REPLACE INTO offline_translations(source_type,source_id,translated_text) VALUES(?,?,?)',
+        values: [translation.sourceType, translation.sourceId, translation.translatedText],
+      })),
+      {
+        statement: `INSERT INTO offline_papers(id,title,status,content_version,last_synced) VALUES(?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET title=excluded.title,status=excluded.status,content_version=excluded.content_version,last_synced=excluded.last_synced`,
+        values: [paperId, manifest.title, 'downloaded', manifest.contentVersion, new Date().toISOString()],
+      },
+    ];
+    await connection.executeSet(statements, true);
+    return;
   }
-}
 
-async function saveTranslationsOffline(translations: ManifestTranslation[]): Promise<void> {
-  if (connection) {
-    for (const t of translations) {
-      await connection.run(
-        `INSERT OR REPLACE INTO offline_translations(source_type,source_id,translated_text) VALUES(?,?,?)`,
-        [t.sourceType, t.sourceId, t.translatedText],
-      );
-    }
-  } else {
-    const existing = JSON.parse(localStorage.getItem('offline:translations') || '[]') as ManifestTranslation[];
-    const map = new Map(existing.map((t) => [`${t.sourceType}:${t.sourceId}`, t]));
-    for (const t of translations) {
-      map.set(`${t.sourceType}:${t.sourceId}`, t);
-    }
-    localStorage.setItem('offline:translations', JSON.stringify([...map.values()]));
-  }
+  localStorage.setItem(`offline:snapshot:${paperId}`, JSON.stringify({
+    paper: { id: paperId, title: manifest.title, status: 'downloaded', contentVersion: manifest.contentVersion, lastSynced: new Date().toISOString() },
+    blocks: manifest.blocks,
+    translations: manifest.translations,
+  }));
 }
 
 async function downloadAssetOffline(paperId: string, url: string, label: string): Promise<void> {
   try {
     const response = await authorizedFetch(resolveApiUrl(url));
-    if (!response.ok) return;
+    if (!response.ok) throw new Error(`asset download failed: HTTP ${response.status}`);
     const blob = await response.blob();
     const base64 = await blobToBase64(blob);
     await putCachedJson(`asset:${paperId}:${label}`, { data: base64, type: blob.type });
   } catch (e) {
     console.warn(`[离线] 资产下载失败 (${label}):`, e);
+    throw e;
   }
 }
 
@@ -382,6 +356,23 @@ export async function getOfflineBlocks(paperId: string): Promise<DocumentBlock[]
   }
 
   // localStorage fallback
+  const snapshot = localStorage.getItem(`offline:snapshot:${paperId}`);
+  if (snapshot) {
+    const parsed = JSON.parse(snapshot) as { blocks: ManifestBlock[] };
+    return parsed.blocks.map((b) => ({
+      id: b.id,
+      blockIndex: b.blockIndex,
+      type: b.type as DocumentBlock['type'],
+      sectionTitle: b.sectionTitle,
+      content: b.content,
+      processedContent: b.processedContent,
+      pageNumber: b.pageNumber,
+      bbox: b.bbox,
+      assetUrl: b.assetUrl,
+      caption: b.caption,
+      translation: b.translation,
+    }));
+  }
   const blocks = localStorage.getItem(`offline:blocks_struct:${paperId}`);
   if (blocks) {
     const parsed = JSON.parse(blocks) as ManifestBlock[];
@@ -411,14 +402,19 @@ export async function getOfflineTranslations(paperId: string): Promise<Record<nu
 
   if (connection) {
     const rows = await connection.query(
-      "SELECT source_id, translated_text FROM offline_translations WHERE source_type = 'block'",
-      [],
+      `SELECT t.source_id, t.translated_text
+       FROM offline_translations t JOIN offline_blocks b ON b.id = t.source_id
+       WHERE t.source_type = 'block' AND b.paper_id = ?`,
+      [paperId],
     );
     for (const row of rows.values || []) {
       result[row.source_id as number] = row.translated_text as string;
     }
   } else {
-    const translations = JSON.parse(localStorage.getItem('offline:translations') || '[]') as ManifestTranslation[];
+    const snapshot = localStorage.getItem(`offline:snapshot:${paperId}`);
+    const translations = snapshot
+      ? (JSON.parse(snapshot) as { translations: ManifestTranslation[] }).translations
+      : JSON.parse(localStorage.getItem('offline:translations') || '[]') as ManifestTranslation[];
     for (const t of translations) {
       if (t.sourceType === 'block') {
         result[t.sourceId] = t.translatedText;
@@ -438,6 +434,7 @@ export async function isPaperDownloadedOffline(paperId: string): Promise<boolean
     );
     return (result.values?.length || 0) > 0;
   }
+  if (localStorage.getItem(`offline:snapshot:${paperId}`)) return true;
   const papers = JSON.parse(localStorage.getItem('offline:papers') || '{}');
   return !!papers[paperId];
 }
@@ -451,6 +448,8 @@ export async function getOfflinePaperVersion(paperId: string): Promise<number | 
     );
     return result.values?.[0]?.content_version as number || null;
   }
+  const snapshot = localStorage.getItem(`offline:snapshot:${paperId}`);
+  if (snapshot) return (JSON.parse(snapshot) as { paper: { contentVersion: number } }).paper.contentVersion;
   const papers = JSON.parse(localStorage.getItem('offline:papers') || '{}');
   return papers[paperId]?.contentVersion || null;
 }
@@ -467,17 +466,7 @@ export async function saveOfflineReviewEvent(
   reviewedAt: string,
 ): Promise<void> {
   await initOfflineDb();
-  if (connection) {
-    await connection.run(
-      `INSERT OR IGNORE INTO offline_review_events(id,vocab_id,grade,response_time_ms,reviewed_at,synced,created_at)
-       VALUES(?,?,?,?,?,?,?)`,
-      [eventId, vocabId, grade, responseTimeMs || null, reviewedAt, 0, new Date().toISOString()],
-    );
-  } else {
-    const events = JSON.parse(localStorage.getItem('offline:review_events') || '[]') as unknown[];
-    events.push({ id: eventId, vocabId, grade, responseTimeMs, reviewedAt, synced: false, createdAt: new Date().toISOString() });
-    localStorage.setItem('offline:review_events', JSON.stringify(events));
-  }
+  await putOutboxItem(eventId, 'review', { eventId, vocabId, grade, responseTimeMs, reviewedAt });
 }
 
 // ============================================================
@@ -487,16 +476,7 @@ export async function saveOfflineReviewEvent(
 export async function saveOfflineVocabAddition(payload: Record<string, unknown>): Promise<string> {
   const id = crypto.randomUUID();
   await initOfflineDb();
-  if (connection) {
-    await connection.run(
-      'INSERT OR REPLACE INTO offline_vocab_queue(id,payload,synced,created_at) VALUES(?,?,?,?)',
-      [id, JSON.stringify(payload), 0, new Date().toISOString()],
-    );
-  } else {
-    const queue = JSON.parse(localStorage.getItem('offline:vocab_queue') || '[]') as unknown[];
-    queue.push({ id, payload, synced: false, createdAt: new Date().toISOString() });
-    localStorage.setItem('offline:vocab_queue', JSON.stringify(queue));
-  }
+  await putOutboxItem(id, 'add_vocab', payload);
   return id;
 }
 
@@ -509,169 +489,110 @@ export async function syncOfflineData(): Promise<{ synced: number; failed: numbe
   let synced = 0;
   let failed = 0;
 
-  // 1. Sync review events
-  try {
-    const events = await getUnsyncedReviewEvents();
-    for (const event of events) {
-      try {
-        await api.post(`/vocab/review/${event.vocabId}`, {
-          grade: event.grade,
-          responseTimeMs: event.responseTimeMs,
-          eventId: event.id,
-          reviewedAt: event.reviewedAt,
-        });
-        await markReviewEventSynced(event.id);
-        synced++;
-      } catch (e) {
-        console.warn('[同步] 复习事件同步失败:', e);
-        failed++;
-      }
-    }
-  } catch (e) {
-    console.warn('[同步] 获取复习事件失败:', e);
-  }
-
-  // 2. Sync vocab additions
-  try {
-    const vocabs = await getUnsyncedVocabQueue();
-    for (const item of vocabs) {
-      try {
+  const items = await getOutboxItems();
+  for (const item of items) {
+    try {
+      if (item.type === 'add_vocab') {
         await api.post('/vocab/add', item.payload);
-        await markVocabQueueSynced(item.id);
-        synced++;
-      } catch (e) {
-        console.warn('[同步] 生词同步失败:', e);
-        failed++;
+      } else if (item.type === 'review') {
+        const payload = item.payload as { vocabId: number };
+        await api.post(`/vocab/review/${payload.vocabId}`, item.payload);
+      } else {
+        throw new Error(`未知离线操作: ${item.type}`);
       }
+      await removeOutboxItem(item.id);
+      synced++;
+    } catch (error) {
+      await recordOutboxFailure(item.id, error instanceof Error ? error.message : String(error));
+      failed++;
     }
-  } catch (e) {
-    console.warn('[同步] 获取生词队列失败:', e);
-  }
-
-  // 3. Sync legacy offline actions
-  try {
-    const actions = await getLegacyOfflineActions();
-    for (const action of actions) {
-      try {
-        if (action.type === 'add_vocab') {
-          await api.post('/vocab/add', action.payload);
-        } else if (action.type === 'review') {
-          const payload = action.payload as { vocabId: number; grade: string };
-          await api.post(`/vocab/review/${payload.vocabId}`, action.payload);
-        }
-        await removeLegacyAction(action.id);
-        synced++;
-      } catch (e) {
-        console.warn('[同步] 旧队列同步失败:', e);
-        failed++;
-      }
-    }
-  } catch (e) {
-    console.warn('[同步] 获取旧队列失败:', e);
   }
 
   return { synced, failed };
 }
 
-// ============================================================
-// Internal helpers for sync
-// ============================================================
-
-interface UnsyncedEvent {
-  id: string;
-  vocabId: number;
-  grade: string;
-  responseTimeMs: number | null;
-  reviewedAt: string;
-}
-
-async function getUnsyncedReviewEvents(): Promise<UnsyncedEvent[]> {
-  if (connection) {
-    const result = await connection.query(
-      'SELECT id, vocab_id, grade, response_time_ms, reviewed_at FROM offline_review_events WHERE synced = 0 ORDER BY created_at ASC',
-      [],
-    );
-    return (result.values || []).map((row) => ({
-      id: row.id as string,
-      vocabId: row.vocab_id as number,
-      grade: row.grade as string,
-      responseTimeMs: row.response_time_ms as number | null,
-      reviewedAt: row.reviewed_at as string,
-    }));
-  }
-  const events = JSON.parse(localStorage.getItem('offline:review_events') || '[]') as (UnsyncedEvent & { synced: boolean })[];
-  return events.filter((e) => !e.synced);
-}
-
-async function markReviewEventSynced(id: string): Promise<void> {
-  if (connection) {
-    await connection.run('UPDATE offline_review_events SET synced = 1 WHERE id = ?', [id]);
-  } else {
-    const events = JSON.parse(localStorage.getItem('offline:review_events') || '[]') as (UnsyncedEvent & { synced: boolean })[];
-    const updated = events.map((e) => (e.id === id ? { ...e, synced: true } : e));
-    localStorage.setItem('offline:review_events', JSON.stringify(updated));
-  }
-}
-
-interface UnsyncedVocab {
-  id: string;
-  payload: Record<string, unknown>;
-}
-
-async function getUnsyncedVocabQueue(): Promise<UnsyncedVocab[]> {
-  if (connection) {
-    const result = await connection.query(
-      'SELECT id, payload FROM offline_vocab_queue WHERE synced = 0 ORDER BY created_at ASC',
-      [],
-    );
-    return (result.values || []).map((row) => ({
-      id: row.id as string,
-      payload: JSON.parse(row.payload as string),
-    }));
-  }
-  const queue = JSON.parse(localStorage.getItem('offline:vocab_queue') || '[]') as (UnsyncedVocab & { synced: boolean })[];
-  return queue.filter((v) => !v.synced);
-}
-
-async function markVocabQueueSynced(id: string): Promise<void> {
-  if (connection) {
-    await connection.run('UPDATE offline_vocab_queue SET synced = 1 WHERE id = ?', [id]);
-  } else {
-    const queue = JSON.parse(localStorage.getItem('offline:vocab_queue') || '[]') as (UnsyncedVocab & { synced: boolean })[];
-    const updated = queue.map((v) => (v.id === id ? { ...v, synced: true } : v));
-    localStorage.setItem('offline:vocab_queue', JSON.stringify(updated));
-  }
-}
-
-interface LegacyAction {
+interface OutboxItem {
   id: string;
   type: string;
   payload: unknown;
 }
 
-async function getLegacyOfflineActions(): Promise<LegacyAction[]> {
+async function putOutboxItem(id: string, type: string, payload: unknown): Promise<void> {
   if (connection) {
-    const result = await connection.query(
-      'SELECT id, action_type, payload FROM offline_actions ORDER BY created_at ASC',
-      [],
+    await connection.run(
+      'INSERT OR IGNORE INTO offline_outbox(id,action_type,payload,created_at) VALUES(?,?,?,?)',
+      [id, type, JSON.stringify(payload), new Date().toISOString()],
     );
-    return (result.values || []).map((row) => ({
-      id: row.id as string,
-      type: row.action_type as string,
-      payload: JSON.parse(row.payload as string),
-    }));
+    return;
   }
-  return JSON.parse(localStorage.getItem('offline:actions') || '[]');
+  const items = JSON.parse(localStorage.getItem('offline:outbox') || '[]') as Array<OutboxItem & { attempts: number; createdAt: string }>;
+  if (!items.some((item) => item.id === id)) {
+    items.push({ id, type, payload, attempts: 0, createdAt: new Date().toISOString() });
+    localStorage.setItem('offline:outbox', JSON.stringify(items));
+  }
 }
 
-async function removeLegacyAction(id: string): Promise<void> {
+async function getOutboxItems(): Promise<OutboxItem[]> {
   if (connection) {
-    await connection.run('DELETE FROM offline_actions WHERE id = ?', [id]);
-  } else {
-    const actions = JSON.parse(localStorage.getItem('offline:actions') || '[]') as (LegacyAction & { createdAt: string })[];
-    const filtered = actions.filter((a) => a.id !== id);
-    localStorage.setItem('offline:actions', JSON.stringify(filtered));
+    const result = await connection.query('SELECT id, action_type, payload FROM offline_outbox ORDER BY created_at', []);
+    return (result.values || []).map((row) => ({ id: row.id as string, type: row.action_type as string, payload: JSON.parse(row.payload as string) }));
   }
+  return JSON.parse(localStorage.getItem('offline:outbox') || '[]') as OutboxItem[];
+}
+
+async function removeOutboxItem(id: string): Promise<void> {
+  if (connection) {
+    await connection.executeSet([
+      { statement: 'DELETE FROM offline_outbox WHERE id = ?', values: [id] },
+      { statement: 'DELETE FROM offline_actions WHERE id = ?', values: [id] },
+      { statement: 'DELETE FROM offline_review_events WHERE id = ?', values: [id] },
+      { statement: 'DELETE FROM offline_vocab_queue WHERE id = ?', values: [id] },
+    ], true);
+    return;
+  }
+  const items = JSON.parse(localStorage.getItem('offline:outbox') || '[]') as OutboxItem[];
+  localStorage.setItem('offline:outbox', JSON.stringify(items.filter((item) => item.id !== id)));
+}
+
+async function recordOutboxFailure(id: string, message: string): Promise<void> {
+  if (connection) {
+    await connection.run('UPDATE offline_outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?', [message.slice(0, 500), id]);
+    return;
+  }
+  const items = JSON.parse(localStorage.getItem('offline:outbox') || '[]') as Array<OutboxItem & { attempts?: number; lastError?: string }>;
+  localStorage.setItem('offline:outbox', JSON.stringify(items.map((item) => item.id === id ? { ...item, attempts: (item.attempts || 0) + 1, lastError: message.slice(0, 500) } : item)));
+}
+
+async function migrateLegacyOutbox(): Promise<void> {
+  if (!connection) return;
+  const actions = await connection.query('SELECT id, action_type, payload FROM offline_actions', []);
+  const reviews = await connection.query('SELECT id, vocab_id, grade, response_time_ms, reviewed_at FROM offline_review_events WHERE synced = 0', []);
+  const vocabs = await connection.query('SELECT id, payload FROM offline_vocab_queue WHERE synced = 0', []);
+  const statements: capSQLiteSet[] = [];
+  for (const row of actions.values || []) statements.push({ statement: 'INSERT OR IGNORE INTO offline_outbox(id,action_type,payload,created_at) VALUES(?,?,?,?)', values: [row.id, row.action_type, row.payload, new Date().toISOString()] });
+  for (const row of reviews.values || []) statements.push({
+    statement: 'INSERT OR IGNORE INTO offline_outbox(id,action_type,payload,created_at) VALUES(?,?,?,?)',
+    values: [row.id, 'review', JSON.stringify({ eventId: row.id, vocabId: row.vocab_id, grade: row.grade, responseTimeMs: row.response_time_ms, reviewedAt: row.reviewed_at }), new Date().toISOString()],
+  });
+  for (const row of vocabs.values || []) statements.push({ statement: 'INSERT OR IGNORE INTO offline_outbox(id,action_type,payload,created_at) VALUES(?,?,?,?)', values: [row.id, 'add_vocab', row.payload, new Date().toISOString()] });
+  if (statements.length > 0) await connection.executeSet(statements, true);
+}
+
+function migrateLegacyWebOutbox(): void {
+  if (localStorage.getItem('offline:outbox:migrated') === '1') return;
+  const outbox = JSON.parse(localStorage.getItem('offline:outbox') || '[]') as OutboxItem[];
+  const seen = new Set(outbox.map((item) => item.id));
+  const actions = JSON.parse(localStorage.getItem('offline:actions') || '[]') as Array<{ id: string; type: string; payload: unknown }>;
+  const reviews = JSON.parse(localStorage.getItem('offline:review_events') || '[]') as Array<{ id: string; vocabId: number; grade: string; responseTimeMs?: number; reviewedAt: string; synced?: boolean }>;
+  const vocabs = JSON.parse(localStorage.getItem('offline:vocab_queue') || '[]') as Array<{ id: string; payload: unknown; synced?: boolean }>;
+  for (const item of actions) if (!seen.has(item.id)) outbox.push({ id: item.id, type: item.type, payload: item.payload });
+  for (const item of reviews) if (!item.synced && !seen.has(item.id)) outbox.push({ id: item.id, type: 'review', payload: { eventId: item.id, vocabId: item.vocabId, grade: item.grade, responseTimeMs: item.responseTimeMs, reviewedAt: item.reviewedAt } });
+  for (const item of vocabs) if (!item.synced && !seen.has(item.id)) outbox.push({ id: item.id, type: 'add_vocab', payload: item.payload });
+  localStorage.setItem('offline:outbox', JSON.stringify(outbox));
+  localStorage.setItem('offline:outbox:migrated', '1');
+  localStorage.removeItem('offline:actions');
+  localStorage.removeItem('offline:review_events');
+  localStorage.removeItem('offline:vocab_queue');
 }
 
 // ============================================================

@@ -5,7 +5,15 @@ import { useReaderStore } from '../stores/readerStore';
 export default function SetupPage({ onPaired }: { onPaired: () => void }) {
   const theme = useReaderStore((s) => s.settings.theme);
   const isDark = theme === 'dark';
-  const [serverUrl, setUrl] = useState(localStorage.getItem('serverUrl') || import.meta.env.VITE_SERVER_URL || 'http://10.0.2.2:3000');
+  const [serverUrl, setUrl] = useState(() => {
+    const stored = localStorage.getItem('serverUrl');
+    const envUrl = import.meta.env.VITE_API_BASE_URL;
+    // Prefer env URL (build-time configured), fall back to stored or emulator default
+    if (envUrl && envUrl !== 'http://localhost:3000/api') {
+      return envUrl.replace(/\/api$/, '');
+    }
+    return stored || 'http://10.0.2.2:3000';
+  });
   const [code, setCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');

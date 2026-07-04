@@ -3,15 +3,20 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { eq, desc } from 'drizzle-orm';
 import { v4 as uuidv4 } from 'uuid';
-import { mkdirSync, unlinkSync, existsSync, readFileSync } from 'fs';
+import { mkdirSync, unlinkSync, existsSync, createReadStream } from 'fs';
+import { writeFile } from 'fs/promises';
+import { Readable } from 'stream';
+import { stream } from 'hono/streaming';
 import { join } from 'path';
 import { db } from '../db/connection.js';
 import { papers } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { ENV } from '../config.js';
 import { enqueuePaperProcessing } from '../services/pdfProcessor.js';
+import { authenticatedClientKey, rateLimit } from '../middleware/rateLimit.js';
 
 const papersRoute = new Hono();
+const uploadRateLimit = rateLimit({ windowMs: 60 * 60_000, max: 20, key: authenticatedClientKey });
 
 // 确保目录存在
 mkdirSync(ENV.PAPERS_DIR, { recursive: true });
@@ -44,7 +49,7 @@ papersRoute.get('/:id', authMiddleware, async (c) => {
 });
 
 // 提供 PDF 文件访问
-papersRoute.get('/:id/file', async (c) => {
+papersRoute.get('/:id/file', authMiddleware, async (c) => {
   const id = c.req.param('id');
   const paper = db.select().from(papers).where(eq(papers.id, id)).get();
   if (!paper) {
@@ -56,17 +61,21 @@ papersRoute.get('/:id/file', async (c) => {
     return c.json({ error: '文件不存在' }, 404);
   }
 
-  const buffer = readFileSync(filePath);
-  return c.body(buffer, 200, {
-    'Content-Type': 'application/pdf',
-    'Content-Length': buffer.length.toString(),
-    'Accept-Ranges': 'bytes',
-    'Cache-Control': 'private, max-age=3600',
+  c.header('Content-Type', 'application/pdf');
+  if (paper.fileSize) c.header('Content-Length', paper.fileSize.toString());
+  c.header('Accept-Ranges', 'bytes');
+  c.header('Cache-Control', 'private, max-age=3600');
+  return stream(c, async (output) => {
+    await output.pipe(Readable.toWeb(createReadStream(filePath)) as ReadableStream);
   });
 });
 
 // 上传论文
-papersRoute.post('/upload', authMiddleware, async (c) => {
+papersRoute.post('/upload', authMiddleware, uploadRateLimit, async (c) => {
+  const contentLength = Number(c.req.header('content-length') || 0);
+  if (contentLength > ENV.MAX_UPLOAD_BYTES + 1024 * 1024) {
+    return c.json({ error: `PDF 不能超过 ${Math.floor(ENV.MAX_UPLOAD_BYTES / 1024 / 1024)} MiB` }, 413);
+  }
   const body = await c.req.parseBody();
   const file = body['file'];
 
@@ -77,6 +86,9 @@ papersRoute.post('/upload', authMiddleware, async (c) => {
   if (!file.name.toLowerCase().endsWith('.pdf')) {
     return c.json({ error: '仅支持 PDF 格式' }, 400);
   }
+  if (file.size > ENV.MAX_UPLOAD_BYTES) {
+    return c.json({ error: `PDF 不能超过 ${Math.floor(ENV.MAX_UPLOAD_BYTES / 1024 / 1024)} MiB` }, 413);
+  }
 
   const id = uuidv4();
   const fileName = `${id}.pdf`;
@@ -84,8 +96,10 @@ papersRoute.post('/upload', authMiddleware, async (c) => {
 
   // 保存文件
   const buffer = Buffer.from(await file.arrayBuffer());
-  const { writeFileSync } = await import('fs');
-  writeFileSync(filePath, buffer);
+  if (buffer.subarray(0, 5).toString('ascii') !== '%PDF-') {
+    return c.json({ error: '文件内容不是有效的 PDF' }, 400);
+  }
+  await writeFile(filePath, buffer, { flag: 'wx' });
 
   // 提取标题（去除 .pdf 后缀）
   const title = body['title'] as string || file.name.replace(/\.pdf$/i, '');

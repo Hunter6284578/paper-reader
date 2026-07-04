@@ -1,7 +1,8 @@
 import { existsSync } from 'fs';
+import { readFile, unlink } from 'fs/promises';
 import { join } from 'path';
 import { spawn } from 'child_process';
-import { asc, eq } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { db, sqlite } from '../db/connection.js';
 import {
   chunks, documentBlocks, pageImages, papers, paragraphs,
@@ -72,7 +73,8 @@ function runDoclingParser(pdfPath: string, outputDir: string): Promise<DoclingRe
 
     console.log(`[pdfProcessor] Spawning Docling parser: ${pythonExe} ${scriptPath} ${pdfPath} ${outputDir}`);
 
-    const child = spawn(pythonExe, [scriptPath, pdfPath, outputDir], {
+    const resultPath = join(outputDir, 'docling-result.json');
+    const child = spawn(pythonExe, [scriptPath, pdfPath, outputDir, '--json-output', resultPath], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
       // 10 minute timeout for large papers
@@ -83,7 +85,7 @@ function runDoclingParser(pdfPath: string, outputDir: string): Promise<DoclingRe
     let stderr = '';
 
     child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
+      stdout = (stdout + chunk.toString()).slice(-32_768);
     });
 
     child.stderr.on('data', (chunk: Buffer) => {
@@ -97,13 +99,19 @@ function runDoclingParser(pdfPath: string, outputDir: string): Promise<DoclingRe
       reject(new Error(`Failed to start Python parser: ${err.message}. Make sure Python and Docling are installed.`));
     });
 
-    child.on('close', (code) => {
+    child.on('close', async (code) => {
       if (stderr.trim()) {
         console.log(`[pdfProcessor] Python stderr:\n${stderr.trim()}`);
       }
 
-      // Try to parse the JSON output from stdout
-      const trimmed = stdout.trim();
+      let trimmed = stdout.trim();
+      try {
+        trimmed = await readFile(resultPath, 'utf8');
+        await unlink(resultPath).catch(() => undefined);
+      } catch {
+        // Backward-compatible fallback for older parser scripts.
+      }
+      // Parse from the result file so large papers do not accumulate JSON in stdout.
       if (!trimmed) {
         reject(new Error(
           `Python parser produced no output (exit code ${code}). stderr: ${stderr.slice(-500)}`
@@ -504,7 +512,7 @@ export async function processPaperAsync(paperId: string): Promise<void> {
 export function enqueuePaperProcessing(paperId: string): void {
   db.insert(processingJobs).values({ paperId, status: 'pending' }).onConflictDoUpdate({
     target: processingJobs.paperId,
-    set: { status: 'pending', lastError: null, finishedAt: null },
+    set: { status: 'pending', attempts: 0, lastError: null, startedAt: null, finishedAt: null },
   }).run();
   db.update(papers).set({
     processingStatus: 'pending', paragraphStatus: 'pending', processingError: null,
@@ -514,15 +522,23 @@ export function enqueuePaperProcessing(paperId: string): void {
 
 async function runNextJob(): Promise<void> {
   if (workerRunning) return;
-  const job = db.select().from(processingJobs)
-    .where(eq(processingJobs.status, 'pending'))
-    .orderBy(asc(processingJobs.createdAt)).get();
+  const job = sqlite.transaction(() => {
+    const pending = sqlite.prepare(`
+      SELECT id, paper_id AS paperId, attempts FROM processing_jobs
+      WHERE status = 'pending' AND created_at <= datetime('now')
+      ORDER BY created_at LIMIT 1
+    `).get() as { id: number; paperId: string; attempts: number } | undefined;
+    if (!pending) return undefined;
+    const claimed = sqlite.prepare(`
+      UPDATE processing_jobs
+      SET status = 'running', attempts = attempts + 1, started_at = datetime('now'), finished_at = NULL
+      WHERE id = ? AND status = 'pending'
+    `).run(pending.id);
+    return claimed.changes === 1 ? { ...pending, attempts: pending.attempts + 1 } : undefined;
+  })();
   if (!job) return;
 
   workerRunning = true;
-  db.update(processingJobs).set({
-    status: 'running', attempts: job.attempts + 1, startedAt: new Date().toISOString(),
-  }).where(eq(processingJobs.id, job.id)).run();
   try {
     await processPaperAsync(job.paperId);
     db.update(processingJobs).set({
@@ -530,9 +546,17 @@ async function runNextJob(): Promise<void> {
     }).where(eq(processingJobs.id, job.id)).run();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    db.update(processingJobs).set({
-      status: 'error', finishedAt: new Date().toISOString(), lastError: message,
-    }).where(eq(processingJobs.id, job.id)).run();
+    if (job.attempts < ENV.MAX_PROCESSING_ATTEMPTS) {
+      sqlite.prepare(`
+        UPDATE processing_jobs
+        SET status = 'pending', created_at = datetime('now', '+5 seconds'), last_error = ?, finished_at = NULL
+        WHERE id = ?
+      `).run(message, job.id);
+    } else {
+      db.update(processingJobs).set({
+        status: 'error', finishedAt: new Date().toISOString(), lastError: message,
+      }).where(eq(processingJobs.id, job.id)).run();
+    }
   } finally {
     workerRunning = false;
     setImmediate(() => void runNextJob());
@@ -540,8 +564,11 @@ async function runNextJob(): Promise<void> {
 }
 
 export function startProcessingWorker(): void {
-  db.update(processingJobs).set({ status: 'pending' })
-    .where(eq(processingJobs.status, 'running')).run();
+  // Recover only stale leases; another process may legitimately own a fresh running job.
+  sqlite.prepare(`
+    UPDATE processing_jobs SET status = 'pending', created_at = datetime('now')
+    WHERE status = 'running' AND started_at < datetime('now', '-15 minutes')
+  `).run();
   if (!workerTimer) {
     workerTimer = setInterval(() => void runNextJob(), 3000);
     workerTimer.unref();

@@ -16,7 +16,10 @@ export const ENV = {
     return 'dev-secret-change-in-production';
   })(),
   JWT_EXPIRES_IN: process.env.JWT_EXPIRES_IN || '7d',
+  DEVICE_TOKEN_EXPIRES_IN: process.env.DEVICE_TOKEN_EXPIRES_IN || '180d',
   DEVICE_PAIRING_CODE: process.env.DEVICE_PAIRING_CODE || '',
+  MAX_UPLOAD_BYTES: parseInt(process.env.MAX_UPLOAD_BYTES || String(100 * 1024 * 1024), 10),
+  MAX_PROCESSING_ATTEMPTS: parseInt(process.env.MAX_PROCESSING_ATTEMPTS || '3', 10),
   SETTINGS_ENCRYPTION_KEY: process.env.SETTINGS_ENCRYPTION_KEY || (() => {
     if (process.env.NODE_ENV === 'production') {
       throw new Error('FATAL: SETTINGS_ENCRYPTION_KEY must be set in production. Generate with: openssl rand -hex 32');
@@ -35,4 +38,5 @@ export const ENV = {
 
   PYTHON_EXECUTABLE: process.env.PYTHON_EXECUTABLE || 'python3',
   PYTHON_PARSER_PATH: process.env.PYTHON_PARSER_PATH || './python/docling_parser.py',
+  MIGRATIONS_DIR: process.env.MIGRATIONS_DIR || './src/db/migrations',
 } as const;

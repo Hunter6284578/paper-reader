@@ -2,18 +2,6 @@ import { sqliteTable, text, integer, real, uniqueIndex, index } from 'drizzle-or
 import { sql } from 'drizzle-orm';
 
 // ============================================================
-// 用户表
-// ============================================================
-export const users = sqliteTable('users', {
-  id: integer('id').primaryKey({ autoIncrement: true }),
-  username: text('username').notNull().unique(),
-  passwordHash: text('password_hash').notNull(),
-  displayName: text('display_name'),
-  createdAt: text('created_at').notNull().default(sql`(datetime('now'))`),
-  updatedAt: text('updated_at').notNull().default(sql`(datetime('now'))`),
-});
-
-// ============================================================
 // 论文表
 // ============================================================
 export const papers = sqliteTable('papers', {

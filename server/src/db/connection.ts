@@ -1,5 +1,6 @@
 import Database, { type Database as DatabaseType } from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { migrate } from 'drizzle-orm/better-sqlite3/migrator';
 import { mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { ENV } from '../config.js';
@@ -9,13 +10,13 @@ import * as schema from './schema.js';
 mkdirSync(dirname(ENV.DB_PATH), { recursive: true });
 
 const sqlite: DatabaseType = new Database(ENV.DB_PATH);
+const db = drizzle(sqlite, { schema });
 
 // 启用 WAL 模式提升并发性能
 sqlite.pragma('journal_mode = WAL');
 sqlite.pragma('foreign_keys = ON');
 
-// 兼容已有部署的数据卷。drizzle-kit push 会把运行时创建的 FTS5 表误判为
-// 待删除表，因此核心新增结构采用幂等、只增不删的启动迁移。
+// Legacy bootstrap helpers are retained only to baseline pre-migration deployments.
 function hasTable(name: string): boolean {
   return Boolean(sqlite.prepare(
     `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`
@@ -160,7 +161,20 @@ const migrateCoreFeatures = sqlite.transaction(() => {
   }
 });
 
-migrateCoreFeatures();
+if (hasTable('papers') && !hasTable('__drizzle_migrations')) {
+  migrateCoreFeatures();
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS __drizzle_migrations (
+      id SERIAL PRIMARY KEY,
+      hash text NOT NULL,
+      created_at numeric
+    );
+  `);
+  sqlite.prepare('INSERT INTO __drizzle_migrations(hash, created_at) VALUES(?, ?)')
+    .run('legacy-baseline', 1783070243671);
+}
 
-export const db = drizzle(sqlite, { schema });
+migrate(db, { migrationsFolder: ENV.MIGRATIONS_DIR });
+
+export { db };
 export { sqlite };

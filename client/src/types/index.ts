@@ -2,17 +2,6 @@
 // 通用类型
 // ============================================================
 
-export interface User {
-  id: number;
-  username: string;
-  displayName: string | null;
-}
-
-export interface AuthResponse {
-  token: string;
-  user: User;
-}
-
 // ============================================================
 // 论文
 // ============================================================

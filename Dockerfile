@@ -58,6 +58,7 @@ COPY --from=backend-build /app/server/package.json ./
 
 # Copy Python parser scripts
 COPY server/python/ ./python/
+COPY server/src/db/migrations/ ./migrations/
 
 # Copy frontend build artifacts (for Nginx)
 COPY --from=frontend-build /app/client/dist /usr/share/nginx/html
@@ -72,6 +73,7 @@ ENV PAPERS_DIR=/data/papers
 ENV UPLOADS_DIR=/data/uploads
 ENV PYTHON_EXECUTABLE=/opt/venv/bin/python3
 ENV PYTHON_PARSER_PATH=/app/python/docling_parser.py
+ENV MIGRATIONS_DIR=/app/migrations
 
 # Memory-friendly: limit OpenBLAS/MKL threads
 ENV OMP_NUM_THREADS=2

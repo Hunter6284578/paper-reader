@@ -6,12 +6,14 @@ import { streamSSE } from 'hono/streaming';
 import { db } from '../db/connection.js';
 import { chatMessages, papers } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { hybridSearch } from '../services/vectorSearch.js';
+import { globalHybridSearch, hybridSearch } from '../services/vectorSearch.js';
 import { streamChat, buildRAGSystemPrompt } from '../services/llmService.js';
 import { ENV } from '../config.js';
 import { getDeepSeekConfig } from '../services/modelSettings.js';
+import { authenticatedClientKey, rateLimit } from '../middleware/rateLimit.js';
 
 const chatRoute = new Hono();
+const modelRateLimit = rateLimit({ windowMs: 60_000, max: 30, key: authenticatedClientKey });
 
 // 获取论文的聊天历史
 chatRoute.get('/history/:paperId', authMiddleware, async (c) => {
@@ -37,7 +39,7 @@ const askSchema = z.object({
   question: z.string().min(1),
 });
 
-chatRoute.post('/ask', authMiddleware, zValidator('json', askSchema), async (c) => {
+chatRoute.post('/ask', authMiddleware, modelRateLimit, zValidator('json', askSchema), async (c) => {
   const { paperId, question } = c.req.valid('json');
 
   if (!getDeepSeekConfig().apiKey) {
@@ -149,44 +151,15 @@ const globalAskSchema = z.object({
   question: z.string().min(1),
 });
 
-chatRoute.post('/ask-global', authMiddleware, zValidator('json', globalAskSchema), async (c) => {
+chatRoute.post('/ask-global', authMiddleware, modelRateLimit, zValidator('json', globalAskSchema), async (c) => {
   const { question } = c.req.valid('json');
 
   if (!getDeepSeekConfig().apiKey) {
     return c.json({ error: 'DeepSeek API 未配置' }, 503);
   }
 
-  // Get all papers with ready processing status
-  const allPapers = db.select({ id: papers.id, title: papers.title })
-    .from(papers)
-    .where(eq(papers.processingStatus, 'ready'))
-    .all();
-
-  if (allPapers.length === 0) {
-    return c.json({ error: '没有已处理的论文' }, 404);
-  }
-
-  // Search top results from each paper
-  const allResults: Array<{
-    chunkId: number;
-    content: string;
-    sectionTitle: string | null;
-    pageNumber: number | null;
-    blockId: number | null;
-    bbox: number[] | null;
-    score: number;
-    paperId: string;
-    paperTitle: string;
-  }> = [];
-
-  for (const paper of allPapers) {
-    const results = await hybridSearch(question, paper.id, 3);
-    results.forEach(r => allResults.push({ ...r, paperId: paper.id, paperTitle: paper.title }));
-  }
-
-  // Sort by score and take top 8
-  allResults.sort((a, b) => b.score - a.score);
-  const topResults = allResults.slice(0, 8);
+  // Build one Retrieval Query, then rank Reading Blocks across all ready Papers.
+  const topResults = await globalHybridSearch(question, 8);
 
   if (topResults.length === 0) {
     return c.json({ error: '未找到相关内容' }, 404);

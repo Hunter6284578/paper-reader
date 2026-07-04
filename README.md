@@ -28,7 +28,7 @@
 
 | 层 | 技术 |
 |---|------|
-| 前端 | React 19 + TypeScript + Tailwind CSS + Capacitor 8 |
+| 前端 | React 18 + TypeScript + Tailwind CSS + Capacitor 8 |
 | 后端 | Hono + better-sqlite3 + Drizzle ORM |
 | PDF 解析 | Docling (Python) / pdfjs-dist fallback |
 | AI | DeepSeek API (流式 SSE) |
@@ -81,6 +81,8 @@ set PYTHONIOENCODING=utf-8
 npm run dev                # http://localhost:3000
 ```
 
+服务端采用单所有者设备配对模型。生产环境必须配置 `DEVICE_PAIRING_CODE`；已配对设备可在 App 的“AI 与设备设置”中查看和撤销。
+
 ### 前端
 
 ```bash
@@ -88,6 +90,37 @@ cd client
 npm install
 npm run dev                # http://localhost:5173
 ```
+
+## 质量检查
+
+```bash
+# 服务端：空库迁移、设备配对/撤销、上传限制、检索融合
+cd server
+npm test
+npm run build
+npm audit --omit=dev
+
+# 客户端：离线 outbox 迁移与幂等同步
+cd ../client
+npm test
+npm run build
+npm audit --omit=dev
+```
+
+GitHub Actions 还会执行 Android `testDebugUnitTest` 冒烟检查。
+Windows 本地项目路径含中文时可运行 `cd client && npm run android:test`；该命令只把测试产物放到临时英文路径，不改变 APK 的正常输出位置。
+
+## 数据库维护
+
+数据库结构由 `server/src/db/migrations/` 下的版本化迁移管理。启动时会自动应用未执行的迁移；手动执行与备份命令如下：
+
+```bash
+cd server
+npm run db:migrate
+npm run db:backup   # 保留最近 5 份备份
+```
+
+旧部署第一次升级时会自动登记为迁移基线，不会删除现有论文数据或运行时 FTS5 表。
 
 ### Android 模拟器
 

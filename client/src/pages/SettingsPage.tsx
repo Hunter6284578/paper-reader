@@ -5,6 +5,15 @@ import { scheduleReviewReminder, cancelReviewReminder, getReminderStatus } from 
 import { useReaderStore } from '../stores/readerStore';
 import type { AiSettings } from '../types';
 
+interface PairedDevice {
+  id: string;
+  label: string;
+  revoked: boolean;
+  current: boolean;
+  createdAt: string;
+  lastSeenAt: string | null;
+}
+
 export default function SettingsPage() {
   const navigate = useNavigate();
   const theme = useReaderStore((s) => s.settings.theme);
@@ -16,6 +25,7 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [reminderEnabled, setReminderEnabled] = useState(false);
   const [reminderHour, setReminderHour] = useState(9);
+  const [devices, setDevices] = useState<PairedDevice[]>([]);
 
   useEffect(() => {
     getAiSettings().then((value) => {
@@ -26,7 +36,21 @@ export default function SettingsPage() {
       setReminderEnabled(status.scheduled);
       if (status.hour !== undefined) setReminderHour(status.hour);
     });
+    api.get<{ devices: PairedDevice[] }>('/auth/devices')
+      .then((value) => setDevices(value.devices))
+      .catch((error) => setStatus(error instanceof Error ? error.message : '设备列表加载失败'));
   }, []);
+
+  const revokeDevice = async (device: PairedDevice) => {
+    if (!confirm(`确定撤销设备“${device.label}”吗？${device.current ? '当前设备将需要重新配对。' : ''}`)) return;
+    const result = await api.delete<{ revokedCurrentDevice: boolean }>(`/auth/devices/${device.id}`);
+    if (result.revokedCurrentDevice) {
+      localStorage.removeItem('token');
+      window.dispatchEvent(new Event('paper-reader:auth-expired'));
+    } else {
+      setDevices((current) => current.map((item) => item.id === device.id ? { ...item, revoked: true } : item));
+    }
+  };
 
   const save = async () => {
     setSaving(true);
@@ -94,6 +118,23 @@ export default function SettingsPage() {
             </button>
           </div>
           {status && <p className={`text-sm ${status.includes('成功') || status.includes('保存') ? 'text-green-500' : isDark ? 'text-gray-400' : 'text-gray-600'}`}>{status}</p>}
+        </div>
+
+        <div className={`rounded-xl border p-4 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
+          <h3 className="font-bold mb-1">已配对设备</h3>
+          <p className={`text-xs mb-3 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>设备令牌可以随时撤销；被撤销设备必须重新输入配对码。</p>
+          <div className="space-y-2">
+            {devices.filter((device) => !device.revoked).map((device) => (
+              <div key={device.id} className={`flex items-center justify-between gap-3 rounded-lg border p-3 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium truncate">{device.label} {device.current && <span className="text-green-500">（当前）</span>}</p>
+                  <p className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>最近使用：{device.lastSeenAt ? new Date(device.lastSeenAt).toLocaleString() : '尚未记录'}</p>
+                </div>
+                <button className="text-sm text-red-500 shrink-0" onClick={() => revokeDevice(device)}>撤销</button>
+              </div>
+            ))}
+            {devices.filter((device) => !device.revoked).length === 0 && <p className="text-sm text-gray-500">开发模式或暂无持久设备记录。</p>}
+          </div>
         </div>
 
         <div className={`rounded-xl border p-4 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>

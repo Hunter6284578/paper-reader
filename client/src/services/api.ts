@@ -6,7 +6,13 @@ function normalizeApiBase(value: string): string {
 }
 
 export function getApiBase(): string {
-  return normalizeApiBase(localStorage.getItem('serverUrl') || import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000');
+  const envUrl = import.meta.env.VITE_API_BASE_URL;
+  const stored = localStorage.getItem('serverUrl');
+  // Prefer build-time env URL when it's a real server (not localhost dev)
+  if (envUrl && !envUrl.includes('localhost') && !envUrl.includes('10.0.2.2')) {
+    return normalizeApiBase(envUrl);
+  }
+  return normalizeApiBase(stored || envUrl || 'http://localhost:3000');
 }
 
 export function setServerUrl(url: string): void {
@@ -30,6 +36,11 @@ export function setToken(token: string): void {
 
 export function clearToken(): void {
   localStorage.removeItem('token');
+}
+
+function notifyExpiredSession(): void {
+  clearToken();
+  window.dispatchEvent(new Event('paper-reader:auth-expired'));
 }
 
 async function request<T>(
@@ -60,6 +71,7 @@ async function request<T>(
       signal: controller.signal,
     });
 
+    if (response.status === 401 && path !== '/auth/pair') notifyExpiredSession();
     if (!response.ok) {
       const error = await response.json().catch(() => ({ error: '请求失败' }));
       throw new Error(error.error || `HTTP ${response.status}`);
@@ -126,15 +138,17 @@ export async function translateParagraphs(paperId: string, ids: number[], mode: 
   return api.post<{ translations: TranslationResult[] }>(`/reading/${paperId}/translate`, { ids, mode });
 }
 
-export function authorizedFetch(path: string, options: RequestInit = {}) {
+export async function authorizedFetch(path: string, options: RequestInit = {}) {
   const token = getToken();
-  return fetch(`${getApiBase()}${path}`, {
+  const response = await fetch(`${getApiBase()}${path}`, {
     ...options,
     headers: {
       ...(options.headers || {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
   });
+  if (response.status === 401) notifyExpiredSession();
+  return response;
 }
 
 export async function fetchPageImages(paperId: string) {

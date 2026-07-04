@@ -340,10 +340,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Parse a PDF with Docling")
     parser.add_argument("pdf_path", help="Path to the PDF file")
     parser.add_argument("output_dir", help="Directory for output images and assets")
+    parser.add_argument("--json-output", help="Write the result JSON to this file instead of stdout")
     args = parser.parse_args()
 
     pdf_path = args.pdf_path
     output_dir = args.output_dir
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    def emit_result(value: dict) -> None:
+        encoded = json.dumps(value, ensure_ascii=False)
+        if args.json_output:
+            Path(args.json_output).write_text(encoded, encoding="utf-8")
+        else:
+            print(encoded)
 
     if not Path(pdf_path).exists():
         result = {
@@ -355,13 +364,12 @@ def main() -> int:
             "visualBlocks": [],
             "pageImages": [],
         }
-        print(json.dumps(result, ensure_ascii=False))
+        emit_result(result)
         return 1
 
     try:
         result = parse_pdf(pdf_path, output_dir)
-        # Output JSON to stdout for the Node.js parent process
-        print(json.dumps(result, ensure_ascii=False))
+        emit_result(result)
         return 0 if result["status"] == "success" else 1
     except Exception as exc:
         error_msg = str(exc)
@@ -376,7 +384,7 @@ def main() -> int:
             "visualBlocks": [],
             "pageImages": [],
         }
-        print(json.dumps(result, ensure_ascii=False))
+        emit_result(result)
         return 1
 
 

@@ -6,24 +6,28 @@ RUN npm ci
 COPY client/ ./
 RUN npm run build
 
-# === Stage 2: Build backend ===
-FROM node:20-alpine AS backend-build
+# === Stage 2: Build backend (use Debian to match production environment) ===
+FROM node:20-bookworm-slim AS backend-build
 WORKDIR /app/server
-RUN apk add --no-cache python3 build-base
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 COPY server/package*.json ./
 RUN npm ci
 COPY server/ ./
-RUN npm run build
+RUN npm run build && npm prune --omit=dev
 
-# === Stage 3: Production (Debian-based for Python/Docling support) ===
-FROM debian:bookworm-slim AS production
+# === Stage 3: Production (Node + Debian for Python/Docling support) ===
+FROM node:20-bookworm-slim AS production
 WORKDIR /app
+
+# Optional mirror override for constrained deployment regions.
+ARG DEBIAN_MIRROR=deb.debian.org
+RUN sed -i "s|deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
+    sed -i "s|deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list 2>/dev/null; \
+    true
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
     ca-certificates \
-    gnupg \
     python3 \
     python3-pip \
     python3-venv \
@@ -37,18 +41,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Node.js 20.x from NodeSource
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
 # Set up Python virtual environment for Docling
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install Python dependencies
+# Install Python dependencies; deployment may override the package index.
+ARG PIP_INDEX_URL=https://pypi.org/simple
 COPY server/python/requirements.txt /tmp/python-requirements.txt
-RUN pip install --no-cache-dir -r /tmp/python-requirements.txt \
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r /tmp/python-requirements.txt \
     && rm /tmp/python-requirements.txt
 
 # Copy backend build artifacts

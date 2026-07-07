@@ -343,6 +343,7 @@ export default function PaperList() {
 
       {/* Floating Global Search Button */}
       <button
+        aria-label="打开全局问答"
         onClick={() => setShowGlobalSearch(true)}
         className="fixed bottom-6 right-6 w-14 h-14 rounded-full bg-primary-500 text-white shadow-lg flex items-center justify-center hover:bg-primary-600 transition-colors z-20"
         title="全局问答"
@@ -356,16 +357,19 @@ export default function PaperList() {
 
       {/* Global Search Modal */}
       {showGlobalSearch && (
-        <div className="fixed inset-0 z-30 flex items-end sm:items-center justify-center" onClick={() => setShowGlobalSearch(false)}>
-          <div className={`absolute inset-0 bg-black/40`} />
+        <div className="fixed inset-0 z-30 flex items-end sm:items-center justify-center">
+          <button type="button" aria-label="关闭全局问答" className="absolute inset-0 bg-black/40" onClick={() => setShowGlobalSearch(false)} />
           <div
-            className={`relative w-full max-w-2xl max-h-[85vh] flex flex-col rounded-t-2xl sm:rounded-2xl overflow-hidden ${isDark ? 'bg-gray-800' : 'bg-white'}`}
-            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="global-search-title"
+            className={`relative w-full max-w-2xl max-h-[85vh] flex flex-col rounded-t-2xl sm:rounded-2xl overflow-hidden overscroll-contain ${isDark ? 'bg-gray-800' : 'bg-white'}`}
           >
             {/* Modal Header */}
             <div className={`flex items-center justify-between px-5 py-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-              <h2 className={`text-base font-semibold ${isDark ? 'text-gray-100' : 'text-gray-900'}`}>全局问答</h2>
+              <h2 id="global-search-title" className={`text-base font-semibold ${isDark ? 'text-gray-100' : 'text-gray-900'}`}>全局问答</h2>
               <button
+                aria-label="关闭"
                 onClick={() => {
                   setShowGlobalSearch(false);
                   if (globalAbortRef.current) globalAbortRef.current.abort();
@@ -383,6 +387,7 @@ export default function PaperList() {
             <div className={`px-5 py-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
               <div className="flex gap-2">
                 <input
+                  aria-label="跨论文提问"
                   type="text"
                   placeholder="跨论文提问..."
                   value={globalQuestion}
@@ -416,9 +421,10 @@ export default function PaperList() {
                       <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>参考来源:</p>
                       <div className="space-y-1.5">
                         {globalReferences.map((ref, i) => (
-                          <div
+                          <button
+                            type="button"
                             key={i}
-                            className={`text-xs px-3 py-1.5 rounded-lg flex items-center gap-2 cursor-pointer ${isDark ? 'bg-gray-700/50 hover:bg-gray-700 text-gray-300' : 'bg-gray-50 hover:bg-gray-100 text-gray-600'}`}
+                            className={`w-full text-left text-xs px-3 py-1.5 rounded-lg flex items-center gap-2 ${isDark ? 'bg-gray-700/50 hover:bg-gray-700 text-gray-300' : 'bg-gray-50 hover:bg-gray-100 text-gray-600'}`}
                             onClick={() => navigate(`/paper/${ref.paperId}`)}
                           >
                             <span className={`font-medium ${isDark ? 'text-primary-400' : 'text-primary-600'}`}>[{ref.index}]</span>
@@ -428,7 +434,7 @@ export default function PaperList() {
                             <span className={`truncate ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
                               {ref.sectionTitle || '未分类'}{ref.pageNumber ? ` p.${ref.pageNumber}` : ''}
                             </span>
-                          </div>
+                          </button>
                         ))}
                       </div>
                     </div>

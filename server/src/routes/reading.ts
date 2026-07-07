@@ -6,11 +6,11 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
-import { eq, and, gte, lt, asc, inArray } from 'drizzle-orm';
+import { eq, and, gte, lt, asc, inArray, sql } from 'drizzle-orm';
 import { db } from '../db/connection.js';
-import { documentBlocks, paragraphs, sentences, translations, papers, userSettings, readingSessions } from '../db/schema.js';
+import { documentBlocks, translations, papers, userSettings, readingSessions } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { translateParagraphs, translateSentences } from '../services/translationService.js';
+import { translateBlocks } from '../services/translationService.js';
 
 const readingRoute = new Hono();
 
@@ -51,49 +51,13 @@ readingRoute.get('/:paperId/structure', authMiddleware, async (c) => {
     });
   }
 
-  // 兼容尚未重新解析的旧论文
-  const allParagraphs = db
-    .select({
-      sectionTitle: paragraphs.sectionTitle,
-      paragraphIndex: paragraphs.paragraphIndex,
-    })
-    .from(paragraphs)
-    .where(eq(paragraphs.paperId, paperId))
-    .orderBy(asc(paragraphs.paragraphIndex))
-    .all();
-
-  // 构建目录结构
-  const sections: Array<{
-    sectionTitle: string;
-    paragraphCount: number;
-    startIndex: number;
-  }> = [];
-
-  let currentSection = '';
-  let count = 0;
-  let startIndex = 0;
-
-  for (const p of allParagraphs) {
-    const title = p.sectionTitle || 'Full Text';
-    if (title !== currentSection) {
-      if (currentSection) {
-        sections.push({ sectionTitle: currentSection, paragraphCount: count, startIndex });
-      }
-      currentSection = title;
-      count = 1;
-      startIndex = p.paragraphIndex;
-    } else {
-      count++;
-    }
-  }
-  if (currentSection) {
-    sections.push({ sectionTitle: currentSection, paragraphCount: count, startIndex });
-  }
-
   return c.json({
-    sections,
-    totalParagraphs: allParagraphs.length,
+    sections: [],
+    totalParagraphs: 0,
+    totalBlocks: 0,
     paragraphStatus: paper.paragraphStatus,
+    processingError: paper.processingError,
+    contentVersion: paper.contentVersion,
   });
 });
 
@@ -102,10 +66,15 @@ readingRoute.get('/:paperId/blocks', authMiddleware, async (c) => {
   const paperId = c.req.param('paperId');
   const offset = Math.max(0, parseInt(c.req.query('offset') || '0', 10));
   const limit = Math.min(Math.max(1, parseInt(c.req.query('limit') || '30', 10)), 80);
-  const all = db.select().from(documentBlocks)
-    .where(eq(documentBlocks.paperId, paperId))
+  const rows = db.select().from(documentBlocks)
+    .where(and(
+      eq(documentBlocks.paperId, paperId),
+      gte(documentBlocks.blockIndex, offset),
+      lt(documentBlocks.blockIndex, offset + limit),
+    ))
     .orderBy(asc(documentBlocks.blockIndex)).all();
-  const rows = all.filter((block) => block.blockIndex >= offset && block.blockIndex < offset + limit);
+  const total = db.select({ count: sql<number>`count(*)` }).from(documentBlocks)
+    .where(eq(documentBlocks.paperId, paperId)).get()?.count || 0;
   const ids = rows.map((row) => row.id);
   const cached = ids.length ? db.select().from(translations).where(and(
     eq(translations.sourceType, 'block'), inArray(translations.sourceId, ids),
@@ -126,7 +95,7 @@ readingRoute.get('/:paperId/blocks', authMiddleware, async (c) => {
       caption: row.caption,
       translation: translationMap.get(row.id) || null,
     })),
-    total: all.length,
+    total,
     offset,
     limit,
   });
@@ -158,7 +127,6 @@ readingRoute.get('/:paperId/manifest', authMiddleware, async (c) => {
 
   const translationMap = new Map(blockTranslations.map((t) => [t.sourceId, t.translatedText]));
 
-  // Also fetch paragraph-level and sentence-level translations for this paper
   const allTranslations = db.select({
     sourceType: translations.sourceType,
     sourceId: translations.sourceId,
@@ -202,124 +170,10 @@ readingRoute.get('/:paperId/manifest', authMiddleware, async (c) => {
   });
 });
 
-// 分页获取段落列表（含句子 + 已有翻译）
-readingRoute.get('/:paperId/paragraphs', authMiddleware, async (c) => {
-  const paperId = c.req.param('paperId');
-  const offset = parseInt(c.req.query('offset') || '0', 10);
-  const limit = Math.min(parseInt(c.req.query('limit') || '20', 10), 50);
-
-  // 获取段落
-  const paraList = db
-    .select()
-    .from(paragraphs)
-    .where(
-      and(
-        eq(paragraphs.paperId, paperId),
-        gte(paragraphs.paragraphIndex, offset),
-        lt(paragraphs.paragraphIndex, offset + limit)
-      )
-    )
-    .orderBy(asc(paragraphs.paragraphIndex))
-    .all();
-
-  if (paraList.length === 0) {
-    return c.json({ paragraphs: [], total: 0, offset, limit });
-  }
-
-  const paraIds = paraList.map((p) => p.id);
-
-  // 获取句子
-  const sentenceList = db
-    .select()
-    .from(sentences)
-    .where(inArray(sentences.paragraphId, paraIds))
-    .orderBy(asc(sentences.paragraphId), asc(sentences.sentenceIndex))
-    .all();
-
-  // 获取已有翻译（段落级）
-  const paraTranslations = db
-    .select()
-    .from(translations)
-    .where(
-      and(
-        eq(translations.sourceType, 'paragraph'),
-        inArray(translations.sourceId, paraIds)
-      )
-    )
-    .all();
-
-  // 获取已有翻译（句子级）
-  const sentenceIds = sentenceList.map((s) => s.id);
-  let sentTranslations: typeof translations.$inferSelect[] = [];
-  if (sentenceIds.length > 0) {
-    sentTranslations = db
-      .select()
-      .from(translations)
-      .where(
-        and(
-          eq(translations.sourceType, 'sentence'),
-          inArray(translations.sourceId, sentenceIds)
-        )
-      )
-      .all();
-  }
-
-  // 构建响应
-  const sentTransMap = new Map(sentTranslations.map((t) => [t.sourceId, t.translatedText]));
-  const paraTransMap = new Map(paraTranslations.map((t) => [t.sourceId, t.translatedText]));
-
-  const sentByPara = new Map<number, Array<{ id: number; sentenceIndex: number; content: string }>>();
-  for (const s of sentenceList) {
-    if (!sentByPara.has(s.paragraphId)) {
-      sentByPara.set(s.paragraphId, []);
-    }
-    sentByPara.get(s.paragraphId)!.push({
-      id: s.id,
-      sentenceIndex: s.sentenceIndex,
-      content: s.content,
-    });
-  }
-
-  const result = paraList.map((p) => {
-    const paraSentences = sentByPara.get(p.id) || [];
-    const sentenceTranslations: Record<number, string> = {};
-    for (const s of paraSentences) {
-      const trans = sentTransMap.get(s.id);
-      if (trans) sentenceTranslations[s.id] = trans;
-    }
-
-    return {
-      id: p.id,
-      sectionTitle: p.sectionTitle,
-      paragraphIndex: p.paragraphIndex,
-      content: p.content,
-      processedContent: p.processedContent || null,
-      charCount: p.charCount,
-      sentences: paraSentences,
-      translation: paraTransMap.get(p.id) || null,
-      sentenceTranslations,
-    };
-  });
-
-  // 获取总段落数
-  const totalResult = db
-    .select({ count: paragraphs.id })
-    .from(paragraphs)
-    .where(eq(paragraphs.paperId, paperId))
-    .all();
-
-  return c.json({
-    paragraphs: result,
-    total: totalResult.length,
-    offset,
-    limit,
-  });
-});
-
 // 批量翻译
 const translateSchema = z.object({
   ids: z.array(z.number()).min(1).max(20),
-  mode: z.enum(['paragraph', 'sentence', 'block']),
+  mode: z.literal('block'),
 });
 
 readingRoute.post('/:paperId/translate', authMiddleware, zValidator('json', translateSchema), async (c) => {
@@ -327,15 +181,7 @@ readingRoute.post('/:paperId/translate', authMiddleware, zValidator('json', tran
   const { ids, mode } = c.req.valid('json');
 
   try {
-    let results;
-    if (mode === 'paragraph') {
-      results = await translateParagraphs(paperId, ids);
-    } else if (mode === 'sentence') {
-      results = await translateSentences(paperId, ids);
-    } else {
-      const { translateBlocks } = await import('../services/translationService.js');
-      results = await translateBlocks(paperId, ids);
-    }
+    const results = await translateBlocks(paperId, ids);
 
     return c.json({ translations: results });
   } catch (e: any) {

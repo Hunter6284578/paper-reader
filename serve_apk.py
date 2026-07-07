@@ -25,11 +25,11 @@ _env = load_env(ENV_FILE)
 
 HOST = os.environ.get('SSH_HOST') or _env.get('SSH_HOST', '')
 USER = os.environ.get('SSH_USER') or _env.get('SSH_USER', 'root')
-PASSWORD = os.environ.get('SSH_PASSWORD') or _env.get('SSH_PASSWORD', '')
+KEY_PATH = os.environ.get('SSH_KEY_PATH') or _env.get('SSH_KEY_PATH', '')
+KNOWN_HOSTS = os.environ.get('SSH_KNOWN_HOSTS') or _env.get('SSH_KNOWN_HOSTS', '')
 
-if not HOST or not PASSWORD:
-    print('错误: 缺少服务器凭据。请创建 .env.deploy 文件（参考 .env.deploy.example）')
-    print('  或设置环境变量 SSH_HOST / SSH_PASSWORD')
+if not HOST or not KEY_PATH or not KNOWN_HOSTS:
+    print('错误: 缺少 SSH_HOST / SSH_KEY_PATH / SSH_KNOWN_HOSTS')
     exit(1)
 
 def run_cmd(ssh, cmd, timeout=30):
@@ -45,9 +45,11 @@ def run_cmd(ssh, cmd, timeout=30):
 
 def main():
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.load_host_keys(str(Path(KNOWN_HOSTS).expanduser()))
+    ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
     print(f'连接服务器 {HOST}...')
-    ssh.connect(HOST, username=USER, password=PASSWORD, timeout=30)
+    ssh.connect(HOST, username=USER, key_filename=str(Path(KEY_PATH).expanduser()), timeout=30,
+                allow_agent=True, look_for_keys=True)
     print('SSH连接成功!')
 
     # 用IP地址和Host头测试

@@ -137,6 +137,24 @@
   padding-bottom: env(safe-area-inset-bottom, 12px);
 }
 
+.reading-block {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 180px;
+}
+
+button, a, input, textarea, select {
+  touch-action: manipulation;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
 /* 引用高亮闪烁 */
 @keyframes citation-flash {
   0% { background-color: rgba(251, 191, 36, 0.45); }

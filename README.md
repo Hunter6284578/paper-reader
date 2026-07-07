@@ -2,7 +2,7 @@
 
 > 面向学术的 Android 论文阅读 App，内置 AI 问答、翻译、生词本与间隔复习。
 
-**版本**: 0.6
+**版本**: 0.7
 
 ## 功能特性
 
@@ -135,7 +135,7 @@ npx cap run android --target emulator-5554
 ```bash
 # 1. 复制部署配置
 cp .env.deploy.example .env.deploy
-# 填入 SSH_HOST, SSH_USER, SSH_PASSWORD
+# 填入 SSH_HOST、SSH_USER、SSH_KEY_PATH、SSH_KNOWN_HOSTS
 
 # 2. 执行部署
 python deploy_final.py

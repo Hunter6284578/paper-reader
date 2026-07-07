@@ -1,7 +1,9 @@
 import { Capacitor } from '@capacitor/core';
 import { CapacitorSQLite, SQLiteConnection, type SQLiteDBConnection, type capSQLiteSet } from '@capacitor-community/sqlite';
+import { Directory, Filesystem } from '@capacitor/filesystem';
 import { api, resolveApiUrl, authorizedFetch } from './api';
 import type { DocumentBlock } from '../types';
+import type { OutboxAction, OutboxStatus, OutboxStore, PaperSnapshotStore } from './offline/contracts';
 
 let connection: SQLiteDBConnection | null = null;
 let initPromise: Promise<void> | null = null;
@@ -126,10 +128,17 @@ async function initNative(): Promise<void> {
       payload TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0,
       last_error TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      next_attempt_at TEXT,
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_offline_outbox_created ON offline_outbox(created_at);
   `);
+
+  const outboxColumns = await connection.query('PRAGMA table_info(offline_outbox)');
+  const names = new Set((outboxColumns.values || []).map((column) => column.name as string));
+  if (!names.has('status')) await connection.execute("ALTER TABLE offline_outbox ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'");
+  if (!names.has('next_attempt_at')) await connection.execute('ALTER TABLE offline_outbox ADD COLUMN next_attempt_at TEXT');
 
   await migrateLegacyOutbox();
 }
@@ -231,15 +240,16 @@ export async function downloadPaperForOffline(paperId: string, onProgress?: (ste
     await downloadAssetOffline(paperId, manifest.pdfUrl, 'pdf');
 
     onProgress?.('下载图表资源...');
+    const localAssets = new Map<number, string>();
     for (let i = 0; i < manifest.assets.length; i++) {
       const asset = manifest.assets[i];
-      await downloadAssetOffline(paperId, asset.url, `block_${asset.blockId}`);
+      localAssets.set(asset.blockId, await downloadAssetOffline(paperId, asset.url, `block_${asset.blockId}`));
       onProgress?.(`下载图表资源... (${i + 1}/${manifest.assets.length})`);
     }
 
     // Metadata, Reading Blocks, and translations become visible atomically.
     onProgress?.('提交离线快照...');
-    await commitPaperSnapshot(paperId, manifest);
+    await commitPaperSnapshot(paperId, manifest, localAssets);
 
     // Also keep the legacy cache for backward compatibility
     await putCachedJson(`blocks:${paperId}`, {
@@ -267,7 +277,7 @@ export async function downloadPaperForOffline(paperId: string, onProgress?: (ste
   }
 }
 
-async function commitPaperSnapshot(paperId: string, manifest: ManifestResponse): Promise<void> {
+async function commitPaperSnapshot(paperId: string, manifest: ManifestResponse, localAssets: Map<number, string>): Promise<void> {
   if (connection) {
     const statements: capSQLiteSet[] = [
       {
@@ -276,12 +286,12 @@ async function commitPaperSnapshot(paperId: string, manifest: ManifestResponse):
       },
       { statement: 'DELETE FROM offline_blocks WHERE paper_id = ?', values: [paperId] },
       ...manifest.blocks.map((block) => ({
-        statement: `INSERT INTO offline_blocks(id,paper_id,block_type,block_index,content,processed_content,section_title,page_number,bbox,asset_path,caption,char_count,translation)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        statement: `INSERT INTO offline_blocks(id,paper_id,block_type,block_index,content,processed_content,section_title,page_number,bbox,asset_path,asset_local_path,caption,char_count,translation)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         values: [
           block.id, paperId, block.type, block.blockIndex, block.content, block.processedContent,
           block.sectionTitle, block.pageNumber, block.bbox ? JSON.stringify(block.bbox) : null,
-          block.assetPath, block.caption, block.charCount, block.translation,
+          block.assetPath, localAssets.get(block.id) || null, block.caption, block.charCount, block.translation,
         ],
       })),
       ...manifest.translations.map((translation) => ({
@@ -300,22 +310,60 @@ async function commitPaperSnapshot(paperId: string, manifest: ManifestResponse):
 
   localStorage.setItem(`offline:snapshot:${paperId}`, JSON.stringify({
     paper: { id: paperId, title: manifest.title, status: 'downloaded', contentVersion: manifest.contentVersion, lastSynced: new Date().toISOString() },
-    blocks: manifest.blocks,
+    blocks: manifest.blocks.map((block) => ({ ...block, assetUrl: localAssets.get(block.id) || block.assetUrl })),
     translations: manifest.translations,
   }));
 }
 
-async function downloadAssetOffline(paperId: string, url: string, label: string): Promise<void> {
+async function downloadAssetOffline(paperId: string, url: string, label: string): Promise<string> {
   try {
     const response = await authorizedFetch(resolveApiUrl(url));
     if (!response.ok) throw new Error(`asset download failed: HTTP ${response.status}`);
     const blob = await response.blob();
-    const base64 = await blobToBase64(blob);
-    await putCachedJson(`asset:${paperId}:${label}`, { data: base64, type: blob.type });
+    if (Capacitor.isNativePlatform()) {
+      const data = (await blobToBase64(blob)).replace(/^data:[^;]+;base64,/, '');
+      const path = `paper-reader/${paperId}/${label}`;
+      await Filesystem.writeFile({ path, data, directory: Directory.Data, recursive: true });
+      return Capacitor.convertFileSrc((await Filesystem.getUri({ path, directory: Directory.Data })).uri);
+    }
+    await putBrowserAsset(`${paperId}:${label}`, blob);
+    return URL.createObjectURL(blob);
   } catch (e) {
     console.warn(`[离线] 资产下载失败 (${label}):`, e);
     throw e;
   }
+}
+
+function openBrowserAssetDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('paper_reader_assets', 1);
+    request.onupgradeneeded = () => request.result.createObjectStore('assets');
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function putBrowserAsset(key: string, blob: Blob): Promise<void> {
+  const database = await openBrowserAssetDb();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction('assets', 'readwrite');
+    transaction.objectStore('assets').put(blob, key);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+  database.close();
+}
+
+async function getBrowserAssetUrl(key: string): Promise<string | null> {
+  if (typeof indexedDB === 'undefined') return null;
+  const database = await openBrowserAssetDb();
+  const blob = await new Promise<Blob | undefined>((resolve, reject) => {
+    const request = database.transaction('assets', 'readonly').objectStore('assets').get(key);
+    request.onsuccess = () => resolve(request.result as Blob | undefined);
+    request.onerror = () => reject(request.error);
+  });
+  database.close();
+  return blob ? URL.createObjectURL(blob) : null;
 }
 
 function blobToBase64(blob: Blob): Promise<string> {
@@ -349,7 +397,7 @@ export async function getOfflineBlocks(paperId: string): Promise<DocumentBlock[]
       processedContent: (row.processed_content as string) || null,
       pageNumber: (row.page_number as number) || null,
       bbox: row.bbox ? JSON.parse(row.bbox as string) : null,
-      assetUrl: row.asset_path ? `/api/images/block/${row.id}` : null,
+      assetUrl: (row.asset_local_path as string) || (row.asset_path ? `/api/images/block/${row.id}` : null),
       caption: (row.caption as string) || null,
       translation: (row.translation as string) || null,
     }));
@@ -359,7 +407,7 @@ export async function getOfflineBlocks(paperId: string): Promise<DocumentBlock[]
   const snapshot = localStorage.getItem(`offline:snapshot:${paperId}`);
   if (snapshot) {
     const parsed = JSON.parse(snapshot) as { blocks: ManifestBlock[] };
-    return parsed.blocks.map((b) => ({
+    return Promise.all(parsed.blocks.map(async (b) => ({
       id: b.id,
       blockIndex: b.blockIndex,
       type: b.type as DocumentBlock['type'],
@@ -368,10 +416,10 @@ export async function getOfflineBlocks(paperId: string): Promise<DocumentBlock[]
       processedContent: b.processedContent,
       pageNumber: b.pageNumber,
       bbox: b.bbox,
-      assetUrl: b.assetUrl,
+      assetUrl: b.assetPath ? (await getBrowserAssetUrl(`${paperId}:block_${b.id}`) || b.assetUrl) : null,
       caption: b.caption,
       translation: b.translation,
-    }));
+    })));
   }
   const blocks = localStorage.getItem(`offline:blocks_struct:${paperId}`);
   if (blocks) {
@@ -515,6 +563,10 @@ interface OutboxItem {
   id: string;
   type: string;
   payload: unknown;
+  attempts?: number;
+  status?: 'pending' | 'retrying' | 'dead';
+  nextAttemptAt?: string;
+  lastError?: string;
 }
 
 async function putOutboxItem(id: string, type: string, payload: unknown): Promise<void> {
@@ -534,10 +586,12 @@ async function putOutboxItem(id: string, type: string, payload: unknown): Promis
 
 async function getOutboxItems(): Promise<OutboxItem[]> {
   if (connection) {
-    const result = await connection.query('SELECT id, action_type, payload FROM offline_outbox ORDER BY created_at', []);
-    return (result.values || []).map((row) => ({ id: row.id as string, type: row.action_type as string, payload: JSON.parse(row.payload as string) }));
+    const result = await connection.query("SELECT id, action_type, payload, attempts, status, next_attempt_at, last_error FROM offline_outbox WHERE status != 'dead' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at", [new Date().toISOString()]);
+    return (result.values || []).map((row) => ({ id: row.id as string, type: row.action_type as string, payload: JSON.parse(row.payload as string), attempts: row.attempts as number, status: row.status as OutboxItem['status'], nextAttemptAt: row.next_attempt_at as string | undefined, lastError: row.last_error as string | undefined }));
   }
-  return JSON.parse(localStorage.getItem('offline:outbox') || '[]') as OutboxItem[];
+  const now = Date.now();
+  return (JSON.parse(localStorage.getItem('offline:outbox') || '[]') as OutboxItem[])
+    .filter((item) => item.status !== 'dead' && (!item.nextAttemptAt || new Date(item.nextAttemptAt).getTime() <= now));
 }
 
 async function removeOutboxItem(id: string): Promise<void> {
@@ -555,12 +609,25 @@ async function removeOutboxItem(id: string): Promise<void> {
 }
 
 async function recordOutboxFailure(id: string, message: string): Promise<void> {
+  const current = await getOutboxItem(id);
+  const attempts = (current?.attempts || 0) + 1;
+  const status = attempts >= 5 ? 'dead' : 'retrying';
+  const nextAttemptAt = new Date(Date.now() + Math.min(60_000, 1000 * (2 ** attempts))).toISOString();
   if (connection) {
-    await connection.run('UPDATE offline_outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?', [message.slice(0, 500), id]);
+    await connection.run('UPDATE offline_outbox SET attempts = ?, last_error = ?, status = ?, next_attempt_at = ? WHERE id = ?', [attempts, message.slice(0, 500), status, nextAttemptAt, id]);
     return;
   }
   const items = JSON.parse(localStorage.getItem('offline:outbox') || '[]') as Array<OutboxItem & { attempts?: number; lastError?: string }>;
-  localStorage.setItem('offline:outbox', JSON.stringify(items.map((item) => item.id === id ? { ...item, attempts: (item.attempts || 0) + 1, lastError: message.slice(0, 500) } : item)));
+  localStorage.setItem('offline:outbox', JSON.stringify(items.map((item) => item.id === id ? { ...item, attempts, status, nextAttemptAt, lastError: message.slice(0, 500) } : item)));
+}
+
+async function getOutboxItem(id: string): Promise<OutboxItem | null> {
+  if (connection) {
+    const result = await connection.query('SELECT id, action_type, payload, attempts, status, next_attempt_at, last_error FROM offline_outbox WHERE id = ?', [id]);
+    const row = result.values?.[0];
+    return row ? { id: row.id as string, type: row.action_type as string, payload: JSON.parse(row.payload as string), attempts: row.attempts as number, status: row.status as OutboxItem['status'], nextAttemptAt: row.next_attempt_at as string | undefined, lastError: row.last_error as string | undefined } : null;
+  }
+  return (JSON.parse(localStorage.getItem('offline:outbox') || '[]') as OutboxItem[]).find((item) => item.id === id) || null;
 }
 
 async function migrateLegacyOutbox(): Promise<void> {
@@ -613,3 +680,33 @@ export function onOnlineChange(callback: (online: boolean) => void): () => void 
     window.removeEventListener('offline', handleOffline);
   };
 }
+
+export async function getOfflineOutboxStatus(): Promise<OutboxStatus> {
+  await initOfflineDb();
+  if (connection) {
+    const result = await connection.query('SELECT status, count(*) AS count FROM offline_outbox GROUP BY status');
+    const status: OutboxStatus = { pending: 0, retrying: 0, dead: 0 };
+    for (const row of result.values || []) {
+      const key = (row.status || 'pending') as keyof OutboxStatus;
+      if (key in status) status[key] = Number(row.count || 0);
+    }
+    return status;
+  }
+  const status: OutboxStatus = { pending: 0, retrying: 0, dead: 0 };
+  for (const item of JSON.parse(localStorage.getItem('offline:outbox') || '[]') as OutboxItem[]) {
+    status[item.status || 'pending']++;
+  }
+  return status;
+}
+
+export const outboxStore: OutboxStore = {
+  enqueue: (action: OutboxAction, id?: string) => queueOfflineAction(action.type, action.payload, id),
+  sync: syncOfflineData,
+  status: getOfflineOutboxStatus,
+};
+
+export const paperSnapshotStore: PaperSnapshotStore = {
+  download: downloadPaperForOffline,
+  blocks: getOfflineBlocks,
+  contentVersion: getOfflinePaperVersion,
+};

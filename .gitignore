@@ -15,6 +15,10 @@ server/.env
 # IDE
 .vscode/
 .idea/
+.vs/
+.android/
+.gradle/
+.worktrees/
 
 # OS files
 .DS_Store
@@ -46,6 +50,8 @@ screenshot.png
 
 # Local scripts
 add_adb_to_path.ps1
+deploy_quick.py
+setup_nginx.py
 
 # Archives
 *.tar.gz

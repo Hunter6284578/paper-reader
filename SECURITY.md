@@ -10,15 +10,18 @@
 | `SETTINGS_ENCRYPTION_KEY` | Yes (production) | Encryption key for stored API keys. Generate with `openssl rand -hex 32` |
 | `DEEPSEEK_API_KEY` | For AI features | DeepSeek API key from https://platform.deepseek.com |
 | `SILICONFLOW_API_KEY` | For embedding | SiliconFlow API key from https://api.siliconflow.cn |
-| `DEVICE_PAIRING_CODE` | Optional | Device pairing code for first-time setup |
+| `DEVICE_PAIRING_CODE` | Yes (production) | Device pairing code for first-time setup |
+| `OWNER_TIMEZONE` | No | Owner calendar timezone; defaults to `Asia/Shanghai` |
+| `CORS_ORIGINS` | Yes (production) | Comma-separated trusted web/Capacitor origins |
 
 ### Deployment (`.env.deploy`)
 
 | Variable | Required | Description |
 |---|---|---|
 | `SSH_HOST` | Yes | Server IP or hostname |
-| `SSH_USER` | Yes | SSH username (default: root) |
-| `SSH_PASSWORD` | Yes | SSH password (consider using SSH keys instead) |
+| `SSH_USER` | Yes | Restricted deployment user |
+| `SSH_KEY_PATH` | Yes | Local private key path |
+| `SSH_KNOWN_HOSTS` | Yes | Local known_hosts file used for strict host verification |
 
 ### Client (`client/.env.production`)
 
@@ -61,8 +64,8 @@ The following secrets were previously committed to version control in plaintext.
 ### Rotation Steps
 
 1. Change the server SSH password on the cloud console
-2. Update `.env.deploy` with the new password
-3. Consider switching to SSH key authentication instead of password auth
+2. Install a deployment public key for a restricted server user
+3. Update `.env.deploy` with the key and known_hosts paths
 4. If the git repo was ever public, assume all previously committed secrets are compromised
 
 ## Best Practices
@@ -70,5 +73,5 @@ The following secrets were previously committed to version control in plaintext.
 - Never commit `.env` files with real values
 - Use `openssl rand -hex 32` to generate secrets
 - Rotate API keys periodically
-- Use SSH key authentication instead of passwords when possible
-- In production, the server will refuse to start without `JWT_SECRET` and `SETTINGS_ENCRYPTION_KEY` set
+- Use SSH key authentication and strict host verification
+- In production, the server refuses to start without `JWT_SECRET`, `SETTINGS_ENCRYPTION_KEY`, and `DEVICE_PAIRING_CODE`

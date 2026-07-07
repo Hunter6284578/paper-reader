@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useChatStore } from '../../stores/chatStore';
 import ChatMessageList from './ChatMessageList';
 import ChatInput from './ChatInput';
@@ -9,11 +9,19 @@ interface ChatBottomSheetProps {
 }
 
 export default function ChatBottomSheet({ paperId, onClose }: ChatBottomSheetProps) {
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   const { messages, streamContent, isStreaming, fetchHistory, sendMessage, clearHistory } = useChatStore();
 
   useEffect(() => {
     fetchHistory(paperId);
   }, [paperId]);
+
+  useEffect(() => {
+    closeButtonRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', closeOnEscape);
+    return () => document.removeEventListener('keydown', closeOnEscape);
+  }, [onClose]);
 
   const handleSend = async (text: string) => {
     try {
@@ -32,16 +40,16 @@ export default function ChatBottomSheet({ paperId, onClose }: ChatBottomSheetPro
 
   return (
     <>
-      <div className="fixed inset-0 z-40 bg-black/30" onClick={onClose} />
-      <div className="fixed bottom-0 left-0 right-0 z-50 h-[65vh] bg-white rounded-t-2xl shadow-2xl flex flex-col">
+      <button type="button" aria-label="关闭 AI 伴读" className="fixed inset-0 z-40 bg-black/30" onClick={onClose} />
+      <div role="dialog" aria-modal="true" aria-labelledby="chat-sheet-title" className="fixed bottom-0 left-0 right-0 z-50 h-[65vh] bg-white rounded-t-2xl shadow-2xl flex flex-col overscroll-contain safe-area-bottom">
         <div className="flex justify-center pt-3 pb-2">
           <div className="w-10 h-1 rounded-full bg-gray-300" />
         </div>
         <div className="px-4 pb-2 flex items-center justify-between border-b border-gray-100">
-          <h3 className="font-medium text-sm text-gray-900">AI 论文伴读</h3>
+          <h3 id="chat-sheet-title" className="font-medium text-sm text-gray-900">AI 论文伴读</h3>
           <div className="flex items-center gap-2">
             <button onClick={handleClear} className="text-gray-400 hover:text-gray-600 text-xs px-2 py-1">清空</button>
-            <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-sm px-2 py-1">✕</button>
+            <button ref={closeButtonRef} aria-label="关闭" onClick={onClose} className="text-gray-400 hover:text-gray-600 text-sm px-2 py-1">✕</button>
           </div>
         </div>
         <ChatMessageList

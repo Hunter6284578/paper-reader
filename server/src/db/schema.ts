@@ -50,8 +50,9 @@ export const highlights = sqliteTable('highlights', {
   id: text('id').primaryKey(),
   paperId: text('paper_id').notNull().references(() => papers.id, { onDelete: 'cascade' }),
   pageNumber: integer('page_number'),
-  paragraphId: integer('paragraph_id'),
-  position: text('position').notNull(),  // JSON: { boundingRect, rects } or { mode:'text', paragraphId, startOffset, endOffset }
+  paragraphId: integer('paragraph_id'), // legacy rollback column; runtime uses blockId
+  blockId: integer('block_id'),
+  position: text('position').notNull(),  // JSON: { mode:'block', blockId, startOffset, endOffset }
   type: text('type').notNull().default('highlight'),
   color: text('color').notNull().default('#FFEB3B'),
   comment: text('comment'),
@@ -60,6 +61,7 @@ export const highlights = sqliteTable('highlights', {
   updatedAt: text('updated_at').notNull().default(sql`(datetime('now'))`),
 }, (table) => [
   index('idx_highlights_paper').on(table.paperId),
+  index('idx_highlights_block').on(table.blockId),
 ]);
 
 // ============================================================

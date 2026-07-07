@@ -39,6 +39,8 @@ jobs:
       - name: Audit client production dependencies
         working-directory: client
         run: npm audit --omit=dev
+      - name: Prepare Compose test environment
+        run: cp .env.example .env
       - name: Validate Compose configuration
         run: docker compose -p paper-reader -f docker-compose.server.yml config --quiet
 

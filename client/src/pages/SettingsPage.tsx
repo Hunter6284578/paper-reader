@@ -4,6 +4,8 @@ import { api, getAiSettings, saveAiSettings } from '../services/api';
 import { scheduleReviewReminder, cancelReviewReminder, getReminderStatus } from '../services/notifications';
 import { useReaderStore } from '../stores/readerStore';
 import type { AiSettings } from '../types';
+import { getOfflineOutboxStatus } from '../services/offlineDb';
+import type { OutboxStatus } from '../services/offline/contracts';
 
 interface PairedDevice {
   id: string;
@@ -26,6 +28,7 @@ export default function SettingsPage() {
   const [reminderEnabled, setReminderEnabled] = useState(false);
   const [reminderHour, setReminderHour] = useState(9);
   const [devices, setDevices] = useState<PairedDevice[]>([]);
+  const [outboxStatus, setOutboxStatus] = useState<OutboxStatus>({ pending: 0, retrying: 0, dead: 0 });
 
   useEffect(() => {
     getAiSettings().then((value) => {
@@ -39,6 +42,7 @@ export default function SettingsPage() {
     api.get<{ devices: PairedDevice[] }>('/auth/devices')
       .then((value) => setDevices(value.devices))
       .catch((error) => setStatus(error instanceof Error ? error.message : '设备列表加载失败'));
+    getOfflineOutboxStatus().then(setOutboxStatus).catch(() => undefined);
   }, []);
 
   const revokeDevice = async (device: PairedDevice) => {
@@ -117,7 +121,13 @@ export default function SettingsPage() {
               测试连接
             </button>
           </div>
-          {status && <p className={`text-sm ${status.includes('成功') || status.includes('保存') ? 'text-green-500' : isDark ? 'text-gray-400' : 'text-gray-600'}`}>{status}</p>}
+          {status && <p aria-live="polite" className={`text-sm ${status.includes('成功') || status.includes('保存') ? 'text-green-500' : isDark ? 'text-gray-400' : 'text-gray-600'}`}>{status}</p>}
+        </div>
+
+        <div className={`rounded-xl border p-4 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
+          <h3 className="font-bold mb-1">离线同步</h3>
+          <p className="text-sm">待同步 {outboxStatus.pending} · 重试中 {outboxStatus.retrying} · 需处理 {outboxStatus.dead}</p>
+          {outboxStatus.dead > 0 && <p className="mt-2 text-sm text-red-500" role="alert">部分离线操作已停止自动重试，请联网后重新执行对应操作。</p>}
         </div>
 
         <div className={`rounded-xl border p-4 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
@@ -142,6 +152,9 @@ export default function SettingsPage() {
           <div className="flex items-center justify-between mb-3">
             <span className="text-sm">每日提醒</span>
             <button
+              role="switch"
+              aria-checked={reminderEnabled}
+              aria-label="每日复习提醒"
               onClick={async () => {
                 if (reminderEnabled) {
                   await cancelReviewReminder();

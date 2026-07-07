@@ -115,14 +115,14 @@ export default function PaperReader() {
 
   // 处理高亮
   const handleHighlight = useCallback(async (color: string) => {
-    if (!id || !selection) return;
+    if (!id || !selection?.blockId) return;
     await addHighlight({
       paperId: id,
       pageNumber: null,
-      paragraphId: selection.paragraphId,
+      blockId: selection.blockId!,
       position: {
-        mode: 'text',
-        paragraphId: selection.paragraphId,
+        mode: 'block',
+        blockId: selection.blockId,
         startOffset: selection.startOffset,
         endOffset: selection.endOffset,
       } as any,

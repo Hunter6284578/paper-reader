@@ -1,22 +1,23 @@
 """
-论文阅读器 — 部署脚本 v5
-凭据从本地 .env.deploy 读取，不再硬编码
+论文阅读器 — 安全部署脚本
 
 用法：
-  1. 复制 .env.deploy.example 为 .env.deploy，填入服务器密码
+  1. 复制 .env.deploy.example 为 .env.deploy，配置 SSH Key 与 known_hosts
   2. python deploy_final.py
 
 .env.deploy 格式：
   SSH_HOST=你的服务器IP
-  SSH_USER=root
-  SSH_PASSWORD=你的密码
+  SSH_USER=deploy
+  SSH_KEY_PATH=你的私钥路径
+  SSH_KNOWN_HOSTS=known_hosts 路径
 """
 
 import paramiko
 import os
 import sys
 import time
-import base64
+import shlex
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------- 凭据加载 ----------
@@ -41,25 +42,25 @@ _env = load_env(ENV_FILE)
 
 HOST = os.environ.get('SSH_HOST') or _env.get('SSH_HOST', '')
 USER = os.environ.get('SSH_USER') or _env.get('SSH_USER', 'root')
-PASSWORD = os.environ.get('SSH_PASSWORD') or _env.get('SSH_PASSWORD', '')
+KEY_PATH = os.environ.get('SSH_KEY_PATH') or _env.get('SSH_KEY_PATH', '')
+KNOWN_HOSTS = os.environ.get('SSH_KNOWN_HOSTS') or _env.get('SSH_KNOWN_HOSTS', '')
 
-if not HOST or not PASSWORD:
-    print('错误: 缺少服务器凭据。请创建 .env.deploy 文件（参考 .env.deploy.example）')
-    print('  或设置环境变量 SSH_HOST / SSH_PASSWORD')
+if not HOST or not KEY_PATH or not KNOWN_HOSTS:
+    print('错误: 缺少 SSH_HOST / SSH_KEY_PATH / SSH_KNOWN_HOSTS')
     sys.exit(1)
 
-LOCAL_TAR = r'D:\论文阅读器\paper-reader-final-deploy.tar.gz'
-REMOTE_DIR = '/opt/paper-reader'
+LOCAL_TAR = os.environ.get('DEPLOY_ARCHIVE') or _env.get('DEPLOY_ARCHIVE', str(Path(__file__).with_name('paper-reader-final-deploy.tar.gz')))
+RELEASE_ROOT = '/opt/paper-reader/releases'
+CURRENT_LINK = '/opt/paper-reader/current'
 REMOTE_TAR = '/tmp/paper-reader-final-deploy.tar.gz'
-CHUNK_SIZE = 48 * 1024
-SLEEP_BETWEEN = 3.0
 
 
 def get_ssh():
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(HOST, username=USER, password=PASSWORD, timeout=30,
-                allow_agent=False, look_for_keys=False)
+    ssh.load_host_keys(str(Path(KNOWN_HOSTS).expanduser()))
+    ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+    ssh.connect(HOST, username=USER, key_filename=str(Path(KEY_PATH).expanduser()), timeout=30,
+                allow_agent=True, look_for_keys=True)
     return ssh
 
 
@@ -87,59 +88,11 @@ def run_cmd(ssh, cmd, timeout=900):
     return exit_code
 
 
-def upload_small_chunks(local, remote):
-    file_size = os.path.getsize(local)
-    total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-    print(f'\n=== 小块上传 {file_size/1024/1024:.2f}MB 分 {total_chunks} 块 ===')
-
-    ssh = get_ssh()
-    run_cmd(ssh, f'rm -f {remote} && touch {remote}')
-    ssh.close()
-    time.sleep(SLEEP_BETWEEN)
-
-    sent = 0
-    with open(local, 'rb') as f:
-        for i in range(total_chunks):
-            raw = f.read(CHUNK_SIZE)
-            if not raw:
-                break
-            b64 = base64.b64encode(raw)
-
-            for attempt in range(3):
-                try:
-                    ssh = get_ssh()
-                    stdin, stdout, stderr = ssh.exec_command(f'base64 -d >> {remote}', timeout=30)
-                    stdin.write(b64)
-                    stdin.flush()
-                    stdin.channel.shutdown_write()
-                    exit_code = stdout.channel.recv_exit_status()
-                    ssh.close()
-                    if exit_code == 0:
-                        break
-                    else:
-                        print(f'  块 {i+1} 失败, 重试 {attempt+1}/3')
-                        time.sleep(SLEEP_BETWEEN * 2)
-                except Exception:
-                    try:
-                        ssh.close()
-                    except:
-                        pass
-                    time.sleep(SLEEP_BETWEEN * 2)
-            else:
-                raise RuntimeError(f'块 {i+1}/{total_chunks} 3次重试均失败')
-
-            sent += len(raw)
-            pct = sent / file_size * 100
-            print(f'  [{i+1}/{total_chunks}] {pct:.0f}%')
-            time.sleep(SLEEP_BETWEEN)
-
-    ssh = get_ssh()
-    stdin, stdout, stderr = ssh.exec_command(f'stat -c %s {remote}')
-    remote_size = int(stdout.read().decode().strip())
-    ssh.close()
-    if remote_size != file_size:
-        raise RuntimeError(f'大小不匹配: {file_size} vs {remote_size}')
-    print(f'  ✅ 上传完成 ({remote_size} bytes)')
+def upload_archive(ssh, local, remote):
+    with ssh.open_sftp() as sftp:
+        sftp.put(local, remote)
+        if sftp.stat(remote).st_size != os.path.getsize(local):
+            raise RuntimeError('部署包上传后大小不一致')
 
 
 def main():
@@ -147,28 +100,45 @@ def main():
         print(f'错误: 部署包不存在 {LOCAL_TAR}')
         sys.exit(1)
 
-    upload_small_chunks(LOCAL_TAR, REMOTE_TAR)
-
     ssh = get_ssh()
     ssh.get_transport().set_keepalive(20)
+    upload_archive(ssh, LOCAL_TAR, REMOTE_TAR)
+    release = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+    release_dir = f'{RELEASE_ROOT}/{release}'
+    quoted_release = shlex.quote(release_dir)
 
-    print('\n=== 解压 ===')
-    run_cmd(ssh, f'mkdir -p {REMOTE_DIR} && cd {REMOTE_DIR} && tar xzf {REMOTE_TAR} && echo OK')
+    print('\n=== 创建版本化 release ===')
+    if run_cmd(ssh, f'mkdir -p {quoted_release} && tar xzf {REMOTE_TAR} -C {quoted_release}') != 0:
+        raise RuntimeError('解压 release 失败')
 
-    print('\n=== 停止旧容器 ===')
-    run_cmd(ssh, f'cd {REMOTE_DIR} && docker compose -f docker-compose.server.yml down 2>&1 || true')
+    previous = run_cmd_capture(ssh, f'readlink -f {CURRENT_LINK} || true')
+
+    print('\n=== 备份数据库 ===')
+    if previous and run_cmd(ssh, "docker exec paper-reader node dist/scripts/backupDb.js") != 0:
+        raise RuntimeError('部署前数据库备份失败')
 
     print('\n=== 构建并启动 ===')
-    run_cmd(ssh, f'cd {REMOTE_DIR} && docker compose -f docker-compose.server.yml up -d --build 2>&1', timeout=900)
-
-    print('\n=== 容器状态 ===')
-    run_cmd(ssh, 'docker ps | grep paper-reader')
+    if run_cmd(ssh, f'cd {quoted_release} && docker compose -p paper-reader -f docker-compose.server.yml up -d --build', timeout=1200) != 0:
+        raise RuntimeError('容器构建或启动失败')
 
     print('\n=== 健康检查 ===')
-    run_cmd(ssh, 'sleep 8 && curl -s http://localhost:3001/api/health')
+    healthy = run_cmd(ssh, "for i in $(seq 1 30); do curl -fsS http://localhost:3001/api/ready && exit 0; sleep 2; done; exit 1") == 0
+    if not healthy:
+        if previous:
+            run_cmd(ssh, f'cd {shlex.quote(previous)} && docker compose -p paper-reader -f docker-compose.server.yml up -d --build', timeout=1200)
+        raise RuntimeError('新版本 readiness 失败，已尝试回滚')
+    run_cmd(ssh, f'ln -sfn {quoted_release} {CURRENT_LINK} && ls -1dt {RELEASE_ROOT}/* | tail -n +4 | xargs -r rm -rf')
 
     ssh.close()
     print('\n✅ 部署完成!')
+
+
+def run_cmd_capture(ssh, cmd):
+    _, stdout, stderr = ssh.exec_command(cmd, timeout=30)
+    value = stdout.read().decode('utf-8', errors='replace').strip()
+    if stdout.channel.recv_exit_status() != 0:
+        raise RuntimeError(stderr.read().decode('utf-8', errors='replace'))
+    return value
 
 
 if __name__ == '__main__':

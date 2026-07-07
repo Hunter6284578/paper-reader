@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 
 interface TextSelection {
   text: string;
-  paragraphId: number | null;
   startOffset: number;
   endOffset: number;
   rect: DOMRect | null;
@@ -70,26 +69,22 @@ export function useTextSelection(containerRef: React.RefObject<HTMLElement | nul
 
     // 找到最近的段落元素
     let node: Node | null = range.commonAncestorContainer;
-    let paragraphEl: HTMLElement | null = null;
+    let blockTextEl: HTMLElement | null = null;
 
     while (node && node !== container) {
-      if (node instanceof HTMLElement && node.dataset.paragraphId) {
-        paragraphEl = node;
+      if (node instanceof HTMLElement && node.dataset.blockText !== undefined) {
+        blockTextEl = node;
         break;
       }
       node = node.parentNode;
     }
 
-    const paragraphId = paragraphEl
-      ? parseInt(paragraphEl.dataset.paragraphId || '0', 10)
-      : null;
-
     // 计算字符偏移
     let startOffset = 0;
     let endOffset = text.length;
 
-    if (paragraphEl) {
-      const textContent = paragraphEl.textContent || '';
+    if (blockTextEl) {
+      const textContent = blockTextEl.textContent || '';
       const fullSelection = text;
 
       // 简单方式：在段落文本中查找选中文本
@@ -102,19 +97,19 @@ export function useTextSelection(containerRef: React.RefObject<HTMLElement | nul
 
     // Extract full sentence from block text
     let fullSentence = text;
-    let blockId: number | null = paragraphId;
+    let blockId: number | null = null;
     let pageNumber: number | null = null;
 
-    if (paragraphEl) {
+    if (blockTextEl) {
       // Get the full block text from data-block-text attribute
-      const blockText = paragraphEl.dataset.blockText || paragraphEl.textContent || '';
+      const blockText = blockTextEl.dataset.blockText || blockTextEl.textContent || '';
       if (blockText) {
         const selectedWord = text.split(/\s+/)[0].replace(/[^a-zA-Z'-]/g, '');
         fullSentence = extractSentence(blockText, selectedWord || text);
       }
 
       // Try to find the parent container with data-page-number
-      let parent: HTMLElement | null = paragraphEl.parentElement;
+      let parent: HTMLElement | null = blockTextEl.parentElement;
       while (parent && parent !== container) {
         if (parent.dataset.pageNumber) {
           const pn = parseInt(parent.dataset.pageNumber, 10);
@@ -131,7 +126,6 @@ export function useTextSelection(containerRef: React.RefObject<HTMLElement | nul
 
     const result: TextSelection = {
       text,
-      paragraphId,
       startOffset,
       endOffset,
       rect: range.getBoundingClientRect(),
@@ -158,19 +152,20 @@ export function useTextSelection(containerRef: React.RefObject<HTMLElement | nul
     const handleSelectionChange = () => {
       setTimeout(handleSelection, 200);
     };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') clearSelection();
+    };
 
     document.addEventListener('mouseup', handleMouseUp);
     document.addEventListener('touchend', handleTouchEnd);
     document.addEventListener('selectionchange', handleSelectionChange);
-    document.addEventListener('keydown', (e) => {
-      // Esc 清除选区
-      if (e.key === 'Escape') clearSelection();
-    });
+    document.addEventListener('keydown', handleKeyDown);
 
     return () => {
       document.removeEventListener('mouseup', handleMouseUp);
       document.removeEventListener('touchend', handleTouchEnd);
       document.removeEventListener('selectionchange', handleSelectionChange);
+      document.removeEventListener('keydown', handleKeyDown);
     };
   }, [handleSelection, clearSelection]);
 

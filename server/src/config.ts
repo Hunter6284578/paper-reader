@@ -4,6 +4,9 @@ config();
 export const ENV = {
   PORT: parseInt(process.env.PORT || '3000', 10),
   NODE_ENV: process.env.NODE_ENV || 'development',
+  APP_VERSION: process.env.APP_VERSION || '0.7.0',
+  OWNER_TIMEZONE: process.env.OWNER_TIMEZONE || 'Asia/Shanghai',
+  CORS_ORIGINS: (process.env.CORS_ORIGINS || 'capacitor://localhost,http://localhost').split(',').map((value) => value.trim()).filter(Boolean),
   DATA_DIR: process.env.DATA_DIR || './data',
   DB_PATH: process.env.DB_PATH || './data/db/app.db',
   PAPERS_DIR: process.env.PAPERS_DIR || './data/papers',
@@ -40,3 +43,13 @@ export const ENV = {
   PYTHON_PARSER_PATH: process.env.PYTHON_PARSER_PATH || './python/docling_parser.py',
   MIGRATIONS_DIR: process.env.MIGRATIONS_DIR || './src/db/migrations',
 } as const;
+
+if (ENV.NODE_ENV === 'production' && !ENV.DEVICE_PAIRING_CODE) {
+  throw new Error('FATAL: DEVICE_PAIRING_CODE must be set in production.');
+}
+
+try {
+  new Intl.DateTimeFormat('en', { timeZone: ENV.OWNER_TIMEZONE }).format();
+} catch {
+  throw new Error(`FATAL: OWNER_TIMEZONE is invalid: ${ENV.OWNER_TIMEZONE}`);
+}

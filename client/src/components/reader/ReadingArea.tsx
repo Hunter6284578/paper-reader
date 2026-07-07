@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import type { DocumentBlock, Highlight, StructureSection } from '../../types';
 import { fetchBlocks, fetchStructure, saveReadingPosition, getReadingPosition, saveReadingSession } from '../../services/api';
 import { getCachedJson, putCachedJson, getOfflineBlocks, syncOfflineData, onOnlineChange, isOnline } from '../../services/offlineDb';
 import { useReaderStore } from '../../stores/readerStore';
 import { useTranslationStore } from '../../stores/translationStore';
 import DocumentBlockView from './DocumentBlockView';
-import PageImageViewer from './PageImageViewer';
+const PageImageViewer = lazy(() => import('./PageImageViewer'));
 
 interface Props {
   paperId: string;
@@ -301,7 +301,7 @@ export default function ReadingArea({ paperId, highlights, containerRef, onSecti
         </button>
       </div>
       {viewMode === 'pages' ? (
-        <PageImageViewer paperId={paperId} target={pageTarget} />
+        <Suspense fallback={null}><PageImageViewer paperId={paperId} target={pageTarget} /></Suspense>
       ) : (
         <div className="max-w-2xl mx-auto px-4 sm:px-6 py-6 pb-20" style={{ fontSize: `${settings.fontSize}px`, lineHeight: settings.lineHeight }}>
           {blocks.map((block) => <DocumentBlockView key={block.id} block={block} highlights={highlights} onVisible={handleVisible} onOpenOriginal={openOriginal} />)}

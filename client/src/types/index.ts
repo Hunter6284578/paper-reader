@@ -49,7 +49,7 @@ export interface Highlight {
   id: string;
   paperId: string;
   pageNumber: number | null;
-  paragraphId: number | null;
+  blockId: number;
   position: HighlightPosition;
   type: 'highlight' | 'area' | 'note';
   color: string;
@@ -149,24 +149,6 @@ export interface ChatReference {
 // 沉浸式阅读
 // ============================================================
 
-export interface Sentence {
-  id: number;
-  sentenceIndex: number;
-  content: string;
-}
-
-export interface Paragraph {
-  id: number;
-  sectionTitle: string | null;
-  paragraphIndex: number;
-  content: string;
-  processedContent: string | null;
-  charCount: number;
-  sentences: Sentence[];
-  translation: string | null;
-  sentenceTranslations: Record<number, string>;
-}
-
 export interface StructureSection {
   sectionTitle: string;
   paragraphCount: number;
@@ -175,7 +157,7 @@ export interface StructureSection {
 
 export interface TranslationResult {
   sourceId: number;
-  sourceType: 'paragraph' | 'sentence' | 'block';
+  sourceType: 'block';
   originalText: string;
   translatedText: string;
 }

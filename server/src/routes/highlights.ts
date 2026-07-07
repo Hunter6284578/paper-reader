@@ -25,7 +25,7 @@ highlightsRoute.get('/paper/:paperId', authMiddleware, async (c) => {
 const createSchema = z.object({
   paperId: z.string(),
   pageNumber: z.number().optional(),
-  paragraphId: z.number().optional(),
+  blockId: z.number().int().positive(),
   position: z.any(),
   type: z.enum(['highlight', 'area', 'note']).optional(),
   color: z.string().optional(),
@@ -41,7 +41,7 @@ highlightsRoute.post('/', authMiddleware, zValidator('json', createSchema), asyn
     id,
     paperId: data.paperId,
     pageNumber: data.pageNumber ?? null,
-    paragraphId: data.paragraphId ?? null,
+    blockId: data.blockId,
     position: JSON.stringify(data.position),
     type: data.type || 'highlight',
     color: data.color || '#FFEB3B',

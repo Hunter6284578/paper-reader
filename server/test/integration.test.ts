@@ -19,6 +19,8 @@ process.env.MAX_UPLOAD_BYTES = '16';
 const { app } = await import('../src/app.js');
 const { sqlite } = await import('../src/db/connection.js');
 const { fuseResults } = await import('../src/services/vectorSearch.js');
+let authorization: { Authorization: string };
+let pairedDeviceId: string;
 
 after(() => {
   sqlite.close();
@@ -31,6 +33,11 @@ test('fresh database is migrated and health is public', async () => {
   assert.ok(tables.some(({ name }) => name === '__drizzle_migrations'));
   const response = await app.request('/api/health');
   assert.equal(response.status, 200);
+  const health = await response.json() as { status: string; version: string; authMode: string };
+  assert.equal(health.status, 'ok');
+  assert.ok(health.version);
+  assert.equal(health.authMode, 'device-pairing');
+  assert.equal((await app.request('/api/ready')).status, 200);
 });
 
 test('protected resources reject an unpaired device', async () => {
@@ -51,7 +58,8 @@ test('pairing creates a revocable device token', async () => {
   });
   assert.equal(paired.status, 200);
   const { token, device } = await paired.json() as { token: string; device: { id: string } };
-  const authorization = { Authorization: `Bearer ${token}` };
+  pairedDeviceId = device.id;
+  authorization = { Authorization: `Bearer ${token}` };
 
   assert.equal((await app.request('/api/papers', { headers: authorization })).status, 200);
   const devices = await app.request('/api/auth/devices', { headers: authorization });
@@ -66,7 +74,32 @@ test('pairing creates a revocable device token', async () => {
   invalid.set('file', new File(['not-pdf'], 'fake.pdf', { type: 'application/pdf' }));
   assert.equal((await app.request('/api/papers/upload', { method: 'POST', headers: authorization, body: invalid })).status, 400);
 
-  const revoke = await app.request(`/api/auth/devices/${device.id}`, { method: 'DELETE', headers: authorization });
+});
+
+test('Reading Block is the canonical highlight and reading interface', async () => {
+  const highlightColumns = sqlite.prepare("PRAGMA table_info('highlights')").all() as Array<{ name: string }>;
+  assert.ok(highlightColumns.some(({ name }) => name === 'block_id'));
+
+  sqlite.prepare("INSERT INTO papers(id,title,file_path) VALUES('canonical-paper','Canonical','canonical.pdf')").run();
+  const block = sqlite.prepare("INSERT INTO document_blocks(paper_id,block_index,block_type,content) VALUES('canonical-paper',0,'text','A canonical Reading Block.') RETURNING id").get() as { id: number };
+
+  const created = await app.request('/api/highlights', {
+    method: 'POST', headers: { ...authorization, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paperId: 'canonical-paper', blockId: block.id, position: { mode: 'block', startOffset: 2, endOffset: 11 } }),
+  });
+  assert.equal(created.status, 201);
+  assert.equal(((await created.json()) as { blockId: number }).blockId, block.id);
+  assert.equal((await app.request('/api/reading/canonical-paper/paragraphs', { headers: authorization })).status, 404);
+
+  const insertBlock = sqlite.prepare("INSERT INTO document_blocks(paper_id,block_index,block_type,content) VALUES('canonical-paper',?,'text',?)");
+  for (let index = 1; index < 75; index++) insertBlock.run(index, `Block ${index}`);
+  const page = await app.request('/api/reading/canonical-paper/blocks?offset=30&limit=10', { headers: authorization });
+  assert.equal(page.status, 200);
+  const pageBody = await page.json() as { total: number; blocks: Array<{ blockIndex: number }> };
+  assert.equal(pageBody.total, 75);
+  assert.deepEqual(pageBody.blocks.map(({ blockIndex }) => blockIndex), [30, 31, 32, 33, 34, 35, 36, 37, 38, 39]);
+
+  const revoke = await app.request(`/api/auth/devices/${pairedDeviceId}`, { method: 'DELETE', headers: authorization });
   assert.equal(revoke.status, 200);
   assert.equal((await app.request('/api/papers', { headers: authorization })).status, 401);
 });

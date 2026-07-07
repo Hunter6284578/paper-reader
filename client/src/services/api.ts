@@ -1,4 +1,4 @@
-import type { AiSettings, DocumentBlock, PageImage, Paragraph, StructureSection, TranslationResult } from '../types';
+import type { AiSettings, DocumentBlock, PageImage, StructureSection, TranslationResult } from '../types';
 
 function normalizeApiBase(value: string): string {
   const base = value.trim().replace(/\/+$/, '');
@@ -123,19 +123,6 @@ export async function fetchStructure(paperId: string) {
     totalParagraphs: number;
     paragraphStatus: string;
   }>(`/reading/${paperId}/structure`);
-}
-
-export async function fetchParagraphs(paperId: string, offset: number, limit: number = 20) {
-  return api.get<{
-    paragraphs: Paragraph[];
-    total: number;
-    offset: number;
-    limit: number;
-  }>(`/reading/${paperId}/paragraphs?offset=${offset}&limit=${limit}`);
-}
-
-export async function translateParagraphs(paperId: string, ids: number[], mode: 'paragraph' | 'sentence' = 'paragraph') {
-  return api.post<{ translations: TranslationResult[] }>(`/reading/${paperId}/translate`, { ids, mode });
 }
 
 export async function authorizedFetch(path: string, options: RequestInit = {}) {

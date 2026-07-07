@@ -3,13 +3,14 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { eq, and, lte, desc, sql, gte, isNull, or } from 'drizzle-orm';
 import { db } from '../db/connection.js';
-import { papers, reviewEvents, vocabContexts, vocabItems, reviewLogs, documentBlocks, sentences, studyLogs, userSettings } from '../db/schema.js';
+import { papers, reviewEvents, vocabContexts, vocabItems, reviewLogs, documentBlocks, studyLogs, userSettings } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { lookupWord } from '../services/dictionary.js';
 import { sm2Schedule, REVIEW_QUALITY_MAP, type ReviewGrade } from '../services/sm2Scheduler.js';
 import { chatCompletion, generateWordAnalysis } from '../services/llmService.js';
 import { ENV } from '../config.js';
 import { getDeepSeekConfig } from '../services/modelSettings.js';
+import { ownerDateKey } from '../services/ownerClock.js';
 
 const vocabRoute = new Hono();
 
@@ -61,29 +62,13 @@ const addSchema = z.object({
 
 /**
  * Extract the sentence containing the target word from a block or paragraph.
- * Tries the sentences table first, then falls back to splitting block content.
+ * Uses the canonical Reading Block content.
  */
 function extractSentenceFromBlock(blockId: number, word: string, paperId?: string): string | null {
-  // Try sentences table first (sentence-level granularity)
-  if (paperId) {
-    // Look up the paragraph that owns this block (for legacy paragraph-based blocks)
-    const block = db.select().from(documentBlocks).where(eq(documentBlocks.id, blockId)).get();
-    if (block) {
-      // Try to find a sentence in the same paragraph containing the word
-      const paraSentences = db.select().from(sentences)
-        .where(eq(sentences.paragraphId, block.blockIndex))
-        .orderBy(sentences.sentenceIndex)
-        .all();
-      for (const s of paraSentences) {
-        if (s.content.toLowerCase().includes(word.toLowerCase())) {
-          return s.content;
-        }
-      }
-    }
-  }
-
-  // Fallback: use the document block content directly
-  const block = db.select().from(documentBlocks).where(eq(documentBlocks.id, blockId)).get();
+  const block = db.select().from(documentBlocks).where(and(
+    eq(documentBlocks.id, blockId),
+    paperId ? eq(documentBlocks.paperId, paperId) : undefined,
+  )).get();
   if (block?.content) {
     return extractSentenceFromText(block.content, word);
   }
@@ -215,17 +200,6 @@ vocabRoute.post('/add', authMiddleware, zValidator('json', addSchema), async (c)
   const contexts = db.select().from(vocabContexts).where(eq(vocabContexts.vocabId, vocabItem.id)).all();
 
   // 记录今日新词（添加时自动记录）
-  const today = new Date().toISOString().split('T')[0];
-  const existingLog = db.select().from(studyLogs).where(eq(studyLogs.date, today)).get();
-  if (existingLog) {
-    db.update(studyLogs)
-      .set({ newWordsCount: existingLog.newWordsCount + 1 })
-      .where(eq(studyLogs.date, today))
-      .run();
-  } else {
-    db.insert(studyLogs).values({ date: today, newWordsCount: 1, reviewCount: 0 }).run();
-  }
-
   return c.json({ vocabItem: { ...vocabItem, contexts } }, 201);
 });
 
@@ -307,7 +281,7 @@ vocabRoute.post('/review/:id', authMiddleware, zValidator('json', reviewSchema),
   }
 
   // 更新今日学习日志（复习计数）
-  const today = new Date().toISOString().split('T')[0];
+  const today = ownerDateKey();
   const existingLog = db.select().from(studyLogs).where(eq(studyLogs.date, today)).get();
   if (existingLog) {
     db.update(studyLogs)
@@ -432,7 +406,7 @@ vocabRoute.post('/learn/:id', authMiddleware, (c) => {
   if (!vocab) return c.json({ error: '生词不存在' }, 404);
 
   const now = new Date().toISOString();
-  const today = now.split('T')[0];
+  const today = ownerDateKey(new Date(now));
 
   // 更新 learnedAt
   if (!vocab.learnedAt) {
@@ -464,7 +438,7 @@ vocabRoute.get('/study-calendar', authMiddleware, (c) => {
   const days = parseInt(c.req.query('days') || '90', 10);
   const startDate = new Date();
   startDate.setDate(startDate.getDate() - days);
-  const startDateStr = startDate.toISOString().split('T')[0];
+  const startDateStr = ownerDateKey(startDate);
 
   const logs = db.select({
     date: studyLogs.date,
@@ -478,11 +452,11 @@ vocabRoute.get('/study-calendar', authMiddleware, (c) => {
 
   // 计算连续打卡天数
   let streak = 0;
-  const today = new Date().toISOString().split('T')[0];
+  const today = ownerDateKey();
   const checkDate = new Date();
 
   while (true) {
-    const dateStr = checkDate.toISOString().split('T')[0];
+    const dateStr = ownerDateKey(checkDate);
     const log = logs.find((l) => l.date === dateStr);
     if (log && (log.newWordsCount > 0 || log.reviewCount > 0)) {
       streak++;

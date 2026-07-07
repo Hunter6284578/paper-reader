@@ -1,10 +1,14 @@
-import { useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import type { DocumentBlock, Highlight } from '../../types';
 import { useReaderStore } from '../../stores/readerStore';
 import { usePaperStore } from '../../stores/paperStore';
 import { useTranslationStore } from '../../stores/translationStore';
 import { resolveApiUrl } from '../../services/api';
-import MathText from './MathText';
+const MathText = lazy(() => import('./MathText'));
+
+function RenderMathText({ text }: { text: string }) {
+  return <Suspense fallback={<>{text}</>}><MathText text={text} /></Suspense>;
+}
 
 interface Props {
   block: DocumentBlock;
@@ -18,7 +22,6 @@ export default function DocumentBlockView({ block, highlights, onVisible, onOpen
   const settings = useReaderStore((state) => state.settings);
   const deleteHighlight = usePaperStore((state) => state.deleteHighlight);
   const [activeHighlightId, setActiveHighlightId] = useState<string | null>(null);
-  const translated = useTranslationStore((state) => state.getParagraphTranslation('', block.id));
   const paperTranslation = useTranslationStore((state) => {
     for (const values of Object.values(state.cache)) if (values[block.id]) return values[block.id];
     return null;
@@ -61,7 +64,7 @@ export default function DocumentBlockView({ block, highlights, onVisible, onOpen
     return (
       <figure ref={ref} data-block-id={block.id} data-block-index={block.blockIndex} className="my-4">
         {hasLatex ? (
-          <div className="overflow-x-auto py-2"><MathText text={block.processedContent!} /></div>
+          <div className="overflow-x-auto py-2"><RenderMathText text={block.processedContent!} /></div>
         ) : block.assetUrl ? (
           <button className="block w-full" onClick={() => block.pageNumber && onOpenOriginal(block.pageNumber, block.bbox)}>
             <img src={resolveApiUrl(block.assetUrl)} className="w-full h-auto rounded-lg border shadow-sm bg-white" loading="lazy" alt={`formula on page ${block.pageNumber}`} />
@@ -76,11 +79,11 @@ export default function DocumentBlockView({ block, highlights, onVisible, onOpen
 
   const text = block.content || '';
   const blockHighlights = highlights.filter((highlight) => {
-    const position = highlight.position as unknown as { mode?: string; paragraphId?: number };
-    return position.mode === 'text' && position.paragraphId === block.id;
+    const position = highlight.position as unknown as { mode?: string; blockId?: number };
+    return highlight.blockId === block.id || (position.mode === 'block' && position.blockId === block.id);
   });
   const renderText = () => {
-    if (!blockHighlights.length) return <MathText text={block.processedContent || text} />;
+    if (!blockHighlights.length) return <RenderMathText text={block.processedContent || text} />;
     const ranges = blockHighlights.map((highlight) => {
       const position = highlight.position as unknown as { startOffset: number; endOffset: number };
       return { start: position.startOffset, end: position.endOffset, color: highlight.color };
@@ -88,7 +91,7 @@ export default function DocumentBlockView({ block, highlights, onVisible, onOpen
     const nodes: React.ReactNode[] = [];
     let cursor = 0;
     ranges.forEach((range, index) => {
-      if (range.start > cursor) nodes.push(<MathText key={`t${index}`} text={text.slice(cursor, range.start)} />);
+      if (range.start > cursor) nodes.push(<RenderMathText key={`t${index}`} text={text.slice(cursor, range.start)} />);
       nodes.push(
         <span key={`m${index}`} className="relative cursor-pointer" onClick={(e) => { e.stopPropagation(); setActiveHighlightId(blockHighlights[index]?.id || null); }}>
           <mark style={{ backgroundColor: `${range.color}60` }}>{text.slice(range.start, range.end)}</mark>
@@ -102,18 +105,18 @@ export default function DocumentBlockView({ block, highlights, onVisible, onOpen
       );
       cursor = Math.max(cursor, range.end);
     });
-    if (cursor < text.length) nodes.push(<MathText key="tlast" text={text.slice(cursor)} />);
+    if (cursor < text.length) nodes.push(<RenderMathText key="tlast" text={text.slice(cursor)} />);
     return nodes;
   };
 
-  const translation = paperTranslation || translated || block.translation;
+  const translation = paperTranslation || block.translation;
   return (
-    <div ref={ref} data-block-id={block.id} data-block-index={block.blockIndex} data-page-number={block.pageNumber || ''} className={`reader-paragraph ${block.type === 'caption' ? 'mb-4 text-sm opacity-80' : 'mb-6'}`}>
-      <p className="reader-text leading-relaxed" data-paragraph-id={block.id} data-block-text={text}>{renderText()}</p>
+    <div ref={ref} data-block-id={block.id} data-block-index={block.blockIndex} data-page-number={block.pageNumber || ''} className={`reader-paragraph reading-block ${block.type === 'caption' ? 'mb-4 text-sm opacity-80' : 'mb-6'}`}>
+      <p className="reader-text leading-relaxed" data-block-text={text}>{renderText()}</p>
       {block.type === 'text' && settings.showTranslation && (
         <div className="mt-2">
           <button className="text-xs opacity-50 mb-1" onClick={() => setExpanded((value) => !value)}>{expanded ? '▼ 收起翻译' : '▶ 显示翻译'}</button>
-          {expanded && <div className="reader-translation text-sm opacity-75 leading-relaxed pl-3 border-l-2 border-current/20">{translation ? <MathText text={translation} /> : (isTranslating ? '翻译中…' : '暂无翻译')}</div>}
+          {expanded && <div className="reader-translation text-sm opacity-75 leading-relaxed pl-3 border-l-2 border-current/20">{translation ? <RenderMathText text={translation} /> : (isTranslating ? '翻译中…' : '暂无翻译')}</div>}
         </div>
       )}
     </div>

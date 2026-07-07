@@ -3,7 +3,8 @@ import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { HTTPException } from 'hono/http-exception';
 import { ENV } from './config.js';
-import './db/connection.js';
+import { sqlite } from './db/connection.js';
+import { randomUUID } from 'crypto';
 import { auth } from './routes/auth.js';
 import { papersRoute } from './routes/papers.js';
 import { highlightsRoute } from './routes/highlights.js';
@@ -16,14 +17,35 @@ import { settingsRoute } from './routes/settings.js';
 export function createApp(): Hono {
   const app = new Hono();
   app.use('*', logger());
+  app.use('*', async (c, next) => {
+    const requestId = c.req.header('X-Request-Id') || randomUUID();
+    c.header('X-Request-Id', requestId);
+    await next();
+  });
   app.use('/api/*', cors({
-    origin: '*',
+    origin: (origin) => {
+      if (ENV.NODE_ENV !== 'production') return origin || '*';
+      return ENV.CORS_ORIGINS.includes(origin) ? origin : undefined;
+    },
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
     allowHeaders: ['Content-Type', 'Authorization'],
     maxAge: 86400,
   }));
 
-  app.get('/api/health', (c) => c.json({ status: 'ok', time: new Date().toISOString() }));
+  app.get('/api/health', (c) => c.json({
+    status: 'ok',
+    version: ENV.APP_VERSION,
+    authMode: ENV.NODE_ENV !== 'production' && !ENV.DEVICE_PAIRING_CODE ? 'development' : 'device-pairing',
+    time: new Date().toISOString(),
+  }));
+  app.get('/api/ready', (c) => {
+    try {
+      sqlite.prepare('SELECT 1').get();
+      return c.json({ status: 'ready', version: ENV.APP_VERSION });
+    } catch {
+      return c.json({ status: 'not-ready' }, 503);
+    }
+  });
   app.route('/api/auth', auth);
   app.route('/api/papers', papersRoute);
   app.route('/api/highlights', highlightsRoute);

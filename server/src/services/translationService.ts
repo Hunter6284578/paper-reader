@@ -5,42 +5,22 @@
 
 import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../db/connection.js';
-import { documentBlocks, paragraphs, sentences, translations } from '../db/schema.js';
+import { documentBlocks, translations } from '../db/schema.js';
 import { chatCompletion } from './llmService.js';
 import { ENV } from '../config.js';
 import { getDeepSeekConfig } from './modelSettings.js';
 
 interface TranslationResult {
   sourceId: number;
-  sourceType: 'paragraph' | 'sentence' | 'block';
+  sourceType: 'block';
   originalText: string;
   translatedText: string;
 }
 
 const BATCH_SIZE = 5;
 
-/**
- * 批量翻译段落（优先查缓存）
- */
-export async function translateParagraphs(
-  paperId: string,
-  paragraphIds: number[]
-): Promise<TranslationResult[]> {
-  return translateBatch(paperId, paragraphIds, 'paragraph');
-}
-
-/**
- * 批量翻译句子
- */
-export async function translateSentences(
-  paperId: string,
-  sentenceIds: number[]
-): Promise<TranslationResult[]> {
-  return translateBatch(paperId, sentenceIds, 'sentence');
-}
-
 export async function translateBlocks(paperId: string, blockIds: number[]): Promise<TranslationResult[]> {
-  return translateBatch(paperId, blockIds, 'block');
+  return translateBatch(paperId, blockIds);
 }
 
 /**
@@ -49,7 +29,6 @@ export async function translateBlocks(paperId: string, blockIds: number[]): Prom
 async function translateBatch(
   paperId: string,
   ids: number[],
-  sourceType: 'paragraph' | 'sentence' | 'block'
 ): Promise<TranslationResult[]> {
   if (ids.length === 0) return [];
 
@@ -59,7 +38,7 @@ async function translateBatch(
     .from(translations)
     .where(
       and(
-        eq(translations.sourceType, sourceType),
+        eq(translations.sourceType, 'block'),
         inArray(translations.sourceId, ids)
       )
     )
@@ -71,7 +50,7 @@ async function translateBatch(
   const uncachedIds = ids.filter((id) => !cachedMap.has(id));
 
   // 3. 获取原文
-  const originalMap = await getOriginalTexts(paperId, uncachedIds, sourceType);
+  const originalMap = await getOriginalTexts(paperId, uncachedIds);
 
   // 4. 批量调用 DeepSeek 翻译
   const newTranslations: TranslationResult[] = [];
@@ -87,14 +66,14 @@ async function translateBatch(
       if (batchTexts.length === 0) continue;
 
       try {
-        const results = await callDeepSeekTranslate(batchTexts, sourceType);
+        const results = await callDeepSeekTranslate(batchTexts);
 
         // 写入缓存
         for (const result of results) {
           try {
             db.insert(translations).values({
               paperId,
-              sourceType,
+              sourceType: 'block',
               sourceId: result.sourceId,
               originalText: result.originalText,
               translatedText: result.translatedText,
@@ -121,7 +100,7 @@ async function translateBatch(
     if (translated) {
       allResults.push({
         sourceId: id,
-        sourceType,
+        sourceType: 'block',
         originalText: text,
         translatedText: translated,
       });
@@ -137,49 +116,19 @@ async function translateBatch(
 async function getOriginalTexts(
   paperId: string,
   ids: number[],
-  sourceType: 'paragraph' | 'sentence' | 'block'
 ): Promise<Map<number, string>> {
   const map = new Map<number, string>();
   if (ids.length === 0) return map;
 
-  if (sourceType === 'paragraph') {
-    const rows = db
-      .select({
-        id: paragraphs.id,
-        content: paragraphs.content,
-        processedContent: paragraphs.processedContent,
-      })
-      .from(paragraphs)
-      .where(
-        and(eq(paragraphs.paperId, paperId), inArray(paragraphs.id, ids))
-      )
-      .all();
-    for (const row of rows) {
-      // 将公式标记一并交给翻译模型，配合 prompt 保证公式原样返回。
-      map.set(row.id, row.processedContent || row.content);
-    }
-  } else if (sourceType === 'sentence') {
-    const rows = db
-      .select({ id: sentences.id, content: sentences.content })
-      .from(sentences)
-      .where(
-        and(eq(sentences.paperId, paperId), inArray(sentences.id, ids))
-      )
-      .all();
-    for (const row of rows) {
-      map.set(row.id, row.content);
-    }
-  } else {
-    const rows = db.select({
-      id: documentBlocks.id,
-      content: documentBlocks.content,
-      processedContent: documentBlocks.processedContent,
-    }).from(documentBlocks).where(and(
-      eq(documentBlocks.paperId, paperId), inArray(documentBlocks.id, ids),
-    )).all();
-    for (const row of rows) {
-      if (row.content) map.set(row.id, row.processedContent || row.content);
-    }
+  const rows = db.select({
+    id: documentBlocks.id,
+    content: documentBlocks.content,
+    processedContent: documentBlocks.processedContent,
+  }).from(documentBlocks).where(and(
+    eq(documentBlocks.paperId, paperId), inArray(documentBlocks.id, ids),
+  )).all();
+  for (const row of rows) {
+    if (row.content) map.set(row.id, row.processedContent || row.content);
   }
 
   return map;
@@ -190,7 +139,6 @@ async function getOriginalTexts(
  */
 async function callDeepSeekTranslate(
   texts: Array<{ id: number; text: string }>,
-  sourceType: 'paragraph' | 'sentence' | 'block' = 'paragraph',
 ): Promise<TranslationResult[]> {
   if (texts.length === 1) {
     // 单段翻译
@@ -201,7 +149,7 @@ async function callDeepSeekTranslate(
 
     return [{
       sourceId: texts[0].id,
-      sourceType,
+      sourceType: 'block',
       originalText: texts[0].text,
       translatedText: translated.trim(),
     }];
@@ -218,7 +166,7 @@ async function callDeepSeekTranslate(
   ], { maxTokens: 4000, temperature: 0.3 });
 
   // 解析结果
-  return parseBatchTranslation(response, texts, sourceType);
+  return parseBatchTranslation(response, texts);
 }
 
 /**
@@ -227,7 +175,6 @@ async function callDeepSeekTranslate(
 function parseBatchTranslation(
   response: string,
   texts: Array<{ id: number; text: string }>,
-  sourceType: 'paragraph' | 'sentence' | 'block',
 ): TranslationResult[] {
   const results: TranslationResult[] = [];
 
@@ -238,7 +185,7 @@ function parseBatchTranslation(
     for (let i = 0; i < texts.length; i++) {
       results.push({
         sourceId: texts[i].id,
-        sourceType,
+        sourceType: 'block',
         originalText: texts[i].text,
         translatedText: parts[i].trim(),
       });
@@ -250,7 +197,7 @@ function parseBatchTranslation(
   console.warn('[翻译服务] 批量翻译解析失败，回退为整段');
   return [{
     sourceId: texts[0].id,
-    sourceType,
+    sourceType: 'block',
     originalText: texts.map((t) => t.text).join('\n\n'),
     translatedText: response.trim(),
   }];

@@ -5,8 +5,7 @@ import { spawn } from 'child_process';
 import { eq } from 'drizzle-orm';
 import { db, sqlite } from '../db/connection.js';
 import {
-  chunks, documentBlocks, pageImages, papers, paragraphs,
-  processingJobs, sentences,
+  chunks, documentBlocks, pageImages, papers, processingJobs,
 } from '../db/schema.js';
 import { ENV } from '../config.js';
 import { detectFormulas } from './formulaDetector.js';
@@ -62,6 +61,12 @@ interface DoclingResult {
   blocks: DoclingBlock[];
   visualBlocks: DoclingVisualBlock[];
   pageImages: DoclingPageImage[];
+}
+
+interface ParserAdapter<TResult> {
+  name: 'docling' | 'pdfjs';
+  parse: (pdfPath: string, paperId: string, outputDir: string) => Promise<TResult>;
+  ingest: (paperId: string, result: TResult) => void;
 }
 
 // ---------- Python Docling Parser Invocation ----------
@@ -133,25 +138,12 @@ function runDoclingParser(pdfPath: string, outputDir: string): Promise<DoclingRe
 
 // ---------- Ingest into Database ----------
 
-function splitSentences(text: string): string[] {
-  return text.replace(/([.!?])\s+/g, '$1|||').split('|||').map((s) => s.trim()).filter(Boolean);
-}
-
 function ingestDoclingResult(paperId: string, result: DoclingResult): void {
   const insertBlock = sqlite.prepare(`
     INSERT INTO document_blocks
       (paper_id, block_index, block_type, section_title, content, processed_content,
        page_number, bbox, asset_path, caption, char_count, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-  `);
-  const insertParagraph = sqlite.prepare(`
-    INSERT INTO paragraphs
-      (paper_id, section_title, paragraph_index, content, processed_content, char_count, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-  `);
-  const insertSentence = sqlite.prepare(`
-    INSERT INTO sentences (paper_id, paragraph_id, sentence_index, content, created_at)
-    VALUES (?, ?, ?, ?, datetime('now'))
   `);
   const insertChunk = sqlite.prepare(`
     INSERT INTO chunks
@@ -165,13 +157,10 @@ function ingestDoclingResult(paperId: string, result: DoclingResult): void {
 
   sqlite.transaction(() => {
     // Clear previous data for this paper
-    sqlite.prepare('DELETE FROM sentences WHERE paper_id = ?').run(paperId);
-    sqlite.prepare('DELETE FROM paragraphs WHERE paper_id = ?').run(paperId);
     sqlite.prepare('DELETE FROM chunks WHERE paper_id = ?').run(paperId);
     sqlite.prepare('DELETE FROM document_blocks WHERE paper_id = ?').run(paperId);
     sqlite.prepare('DELETE FROM page_images WHERE paper_id = ?').run(paperId);
 
-    let paragraphIndex = 0;
     let chunkIndex = 0;
 
     // Insert blocks in reading order
@@ -201,17 +190,6 @@ function ingestDoclingResult(paperId: string, result: DoclingResult): void {
         block.type === 'caption' ? content : null,
         content?.length || 0,
       );
-
-      // Create paragraphs and sentences for text/caption blocks
-      if (content && ['text', 'caption'].includes(block.type)) {
-        const para = insertParagraph.run(
-          paperId, block.sectionTitle, paragraphIndex, content, processed, content.length,
-        );
-        splitSentences(content).forEach((sentence, sentenceIndex) => {
-          insertSentence.run(paperId, para.lastInsertRowid, sentenceIndex, sentence);
-        });
-        paragraphIndex++;
-      }
 
       // Create chunks for search/FTS
       if (content && content.length > 20) {
@@ -250,15 +228,6 @@ function ingestPdfjsResult(paperId: string, doc: { pageCount: number; blocks: Ar
        page_number, bbox, asset_path, caption, char_count, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   `);
-  const insertParagraph = sqlite.prepare(`
-    INSERT INTO paragraphs
-      (paper_id, section_title, paragraph_index, content, processed_content, char_count, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-  `);
-  const insertSentence = sqlite.prepare(`
-    INSERT INTO sentences (paper_id, paragraph_id, sentence_index, content, created_at)
-    VALUES (?, ?, ?, ?, datetime('now'))
-  `);
   const insertChunk = sqlite.prepare(`
     INSERT INTO chunks
       (paper_id, chunk_index, content, section_title, page_number, block_id, token_count, created_at)
@@ -270,13 +239,10 @@ function ingestPdfjsResult(paperId: string, doc: { pageCount: number; blocks: Ar
   `);
 
   sqlite.transaction(() => {
-    sqlite.prepare('DELETE FROM sentences WHERE paper_id = ?').run(paperId);
-    sqlite.prepare('DELETE FROM paragraphs WHERE paper_id = ?').run(paperId);
     sqlite.prepare('DELETE FROM chunks WHERE paper_id = ?').run(paperId);
     sqlite.prepare('DELETE FROM document_blocks WHERE paper_id = ?').run(paperId);
     sqlite.prepare('DELETE FROM page_images WHERE paper_id = ?').run(paperId);
 
-    let paragraphIndex = 0;
     let chunkIndex = 0;
 
     doc.blocks.forEach((block, blockIndex) => {
@@ -294,16 +260,6 @@ function ingestPdfjsResult(paperId: string, doc: { pageCount: number; blocks: Ar
         block.type === 'caption' ? content : null,
         content?.length || 0,
       );
-
-      if (content && ['text', 'caption'].includes(block.type)) {
-        const para = insertParagraph.run(
-          paperId, block.sectionTitle, paragraphIndex, content, processed, content.length,
-        );
-        splitSentences(content).forEach((sentence, sentenceIndex) => {
-          insertSentence.run(paperId, para.lastInsertRowid, sentenceIndex, sentence);
-        });
-        paragraphIndex++;
-      }
 
       if (content && content.length > 20) {
         insertChunk.run(
@@ -329,6 +285,20 @@ function ingestPdfjsResult(paperId: string, doc: { pageCount: number; blocks: Ar
     `);
   })();
 }
+
+type PdfjsResult = Awaited<ReturnType<typeof parseWithPdfjs>>;
+
+const doclingAdapter: ParserAdapter<DoclingResult> = {
+  name: 'docling',
+  parse: (pdfPath, _paperId, outputDir) => runDoclingParser(pdfPath, outputDir),
+  ingest: ingestDoclingResult,
+};
+
+const pdfjsAdapter: ParserAdapter<PdfjsResult> = {
+  name: 'pdfjs',
+  parse: (pdfPath, paperId) => parseWithPdfjs(pdfPath, paperId),
+  ingest: ingestPdfjsResult,
+};
 
 // ---------- Embedding Generation ----------
 
@@ -368,6 +338,41 @@ async function generateChunkEmbeddings(paperId: string): Promise<void> {
   }
 }
 
+async function finalizePaperIngestion(
+  paper: typeof papers.$inferSelect,
+  pageCount: number,
+  blocks: Array<{ type: string; content: string | null }>,
+  adapterName: ParserAdapter<unknown>['name'],
+): Promise<void> {
+  const firstText = blocks.find((block) => block.type === 'text' && block.content)?.content || '';
+  db.update(papers).set({
+    pageCount,
+    abstract: firstText.slice(0, 500),
+    processingStatus: 'ready',
+    paragraphStatus: 'ready',
+    processingError: null,
+    contentVersion: (paper.contentVersion || 1) + 1,
+    updatedAt: new Date().toISOString(),
+  }).where(eq(papers.id, paper.id)).run();
+
+  try {
+    const metadata = await extractMetadata(firstText, paper.title);
+    const hasNewData = (metadata.title && metadata.title !== paper.title) || metadata.authors || metadata.doi;
+    if (hasNewData) {
+      db.update(papers).set({
+        title: metadata.title || paper.title,
+        authors: metadata.authors ? JSON.stringify(metadata.authors) : null,
+        doi: metadata.doi || null,
+        abstract: metadata.abstract || firstText.slice(0, 500),
+      }).where(eq(papers.id, paper.id)).run();
+    }
+  } catch (error) {
+    console.warn(`[Metadata] lookup failed after ${adapterName} ingestion:`, error);
+  }
+
+  await generateChunkEmbeddings(paper.id);
+}
+
 // ---------- Main Processing Function ----------
 
 /** Process a paper using the Docling Python parser. */
@@ -385,7 +390,7 @@ export async function processPaperAsync(paperId: string): Promise<void> {
     const outputDir = join(ENV.UPLOADS_DIR, paperId);
 
     console.log(`[pdfProcessor] Processing paper ${paperId} with Docling...`);
-    const result = await runDoclingParser(filePath, outputDir);
+    const result = await doclingAdapter.parse(filePath, paperId, outputDir);
 
     // Handle scanned PDF error
     if (result.status === 'error' && result.error?.includes('UNSUPPORTED_SCANNED_PDF')) {
@@ -405,43 +410,11 @@ export async function processPaperAsync(paperId: string): Promise<void> {
     }
 
     // Ingest successful result
-    ingestDoclingResult(paperId, result);
-
-    // Extract abstract from first text block
-    const firstText = result.blocks.find(
-      (block) => block.type === 'text' && block.content
-    )?.content || '';
-
-    db.update(papers).set({
-      pageCount: result.pageCount,
-      abstract: firstText.slice(0, 500),
-      processingStatus: 'ready',
-      paragraphStatus: 'ready',
-      processingError: null,
-      contentVersion: (paper.contentVersion || 1) + 1,
-      updatedAt: new Date().toISOString(),
-    }).where(eq(papers.id, paperId)).run();
-
-    // Try to extract metadata from CrossRef
-    try {
-      const metadata = await extractMetadata(firstText, paper.title);
-      const hasNewData = (metadata.title && metadata.title !== paper.title) || metadata.authors || metadata.doi;
-      if (hasNewData) {
-        db.update(papers).set({
-          title: metadata.title || paper.title,
-          authors: metadata.authors ? JSON.stringify(metadata.authors) : null,
-          doi: metadata.doi || null,
-          abstract: metadata.abstract || firstText.slice(0, 500),
-        }).where(eq(papers.id, paperId)).run();
-      }
-    } catch (e) {
-      console.warn('[Metadata] CrossRef lookup failed:', e);
-    }
+    doclingAdapter.ingest(paperId, result);
+    await finalizePaperIngestion(paper, result.pageCount, result.blocks, doclingAdapter.name);
 
     console.log(`[pdfProcessor] Paper ${paperId} processed: ${result.blocks.length} blocks, ${result.pageCount} pages`);
 
-    // Generate embeddings asynchronously (non-blocking)
-    await generateChunkEmbeddings(paperId);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
 
@@ -449,43 +422,12 @@ export async function processPaperAsync(paperId: string): Promise<void> {
     if (message.includes('Python parser') || message.includes('docling') || message.includes('Failed to start') || message.includes('no output')) {
       console.warn(`[pdfProcessor] Docling unavailable, falling back to pdfjs-dist for paper ${paperId}`);
       try {
-        const doc = await parseWithPdfjs(filePath, paperId);
-        ingestPdfjsResult(paperId, doc);
-
-        const firstText = doc.blocks.find(
-          (block) => block.type === 'text' && block.content
-        )?.content || '';
-
-        db.update(papers).set({
-          pageCount: doc.pageCount,
-          abstract: firstText.slice(0, 500),
-          processingStatus: 'ready',
-          paragraphStatus: 'ready',
-          processingError: null,
-          contentVersion: (paper.contentVersion || 1) + 1,
-          updatedAt: new Date().toISOString(),
-        }).where(eq(papers.id, paperId)).run();
-
-        // Try to extract metadata from CrossRef (pdfjs fallback path)
-        try {
-          const metadata = await extractMetadata(firstText, paper.title);
-          const hasNewData = (metadata.title && metadata.title !== paper.title) || metadata.authors || metadata.doi;
-          if (hasNewData) {
-            db.update(papers).set({
-              title: metadata.title || paper.title,
-              authors: metadata.authors ? JSON.stringify(metadata.authors) : null,
-              doi: metadata.doi || null,
-              abstract: metadata.abstract || firstText.slice(0, 500),
-            }).where(eq(papers.id, paperId)).run();
-          }
-        } catch (e) {
-          console.warn('[Metadata] CrossRef lookup failed (pdfjs fallback):', e);
-        }
+        const doc = await pdfjsAdapter.parse(filePath, paperId, '');
+        pdfjsAdapter.ingest(paperId, doc);
+        await finalizePaperIngestion(paper, doc.pageCount, doc.blocks, pdfjsAdapter.name);
 
         console.log(`[pdfProcessor] Paper ${paperId} processed with pdfjs fallback: ${doc.blocks.length} blocks`);
 
-        // Generate embeddings asynchronously (non-blocking)
-        await generateChunkEmbeddings(paperId);
         return;
       } catch (fallbackError) {
         const fbMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);

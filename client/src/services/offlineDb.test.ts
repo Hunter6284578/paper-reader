@@ -44,3 +44,16 @@ test('outbox is idempotent and successful sync removes items', async () => {
   expect(result).toEqual({ synced: 2, failed: 0 });
   expect(JSON.parse(storage.getItem('offline:outbox') || '[]')).toEqual([]);
 });
+
+test('failed outbox items expose retry metadata instead of retrying immediately forever', async () => {
+  await offlineDb.queueOfflineAction('unsupported', { value: true }, 'failed-1');
+  expect(await offlineDb.syncOfflineData()).toEqual({ synced: 0, failed: 1 });
+  const items = JSON.parse(storage.getItem('offline:outbox') || '[]') as Array<{
+    id: string; attempts: number; status: string; nextAttemptAt: string; lastError: string;
+  }>;
+  const failed = items.find(({ id }) => id === 'failed-1');
+  expect(failed?.attempts).toBe(1);
+  expect(failed?.status).toBe('retrying');
+  expect(new Date(failed!.nextAttemptAt).getTime()).toBeGreaterThan(Date.now());
+  expect(failed?.lastError).toContain('未知离线操作');
+});
